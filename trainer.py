@@ -1,10 +1,11 @@
 import argparse
+import hashlib
 import logging
+import math
 import os
 import random
 import sys
 import time
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -19,7 +20,7 @@ from torchvision import transforms
 from icecream import ic
 
 
-def calc_loss(outputs, low_res_label_batch, ce_loss, dice_loss, dice_weight:float=0.8):
+def calc_loss(outputs, low_res_label_batch, ce_loss, dice_loss, dice_weight: float = 0.8):
     low_res_logits = outputs['low_res_logits']
     loss_ce = ce_loss(low_res_logits, low_res_label_batch[:].long())
     loss_dice = dice_loss(low_res_logits, low_res_label_batch, softmax=True)
@@ -132,4 +133,160 @@ def trainer_synapse(args, model, snapshot_path, multimask_output, low_res):
             break
 
     writer.close()
+    return "Training Finished!"
+
+
+def trainer_myops(args, model, snapshot_path, multimask_output, low_res):
+    """Benchmark No-Val Trainer for MyoPS-380 protocol myops380_train304_test76_last_v1."""
+    from datasets.dataset_myops import MyopsDataset, RandomGenerator
+
+    log_file = os.path.join(snapshot_path, "train.log")
+    logging.basicConfig(
+        filename=log_file, level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    logging.getLogger().addHandler(console)
+
+    # Verify dataset split SHA-256
+    train_split_path = os.path.join(args.list_dir, "train.txt")
+    if os.path.isfile(train_split_path):
+        with open(train_split_path, "rb") as fp:
+            train_hash = hashlib.sha256(fp.read()).hexdigest()
+        logging.info("train.txt SHA-256: " + train_hash + " (Expected: 16248ec3630bb0493fb421aab5ffb4dc9b1d0fd49c8614d69d3098a92305f919)")
+        if train_hash != "16248ec3630bb0493fb421aab5ffb4dc9b1d0fd49c8614d69d3098a92305f919":
+            raise RuntimeError(f"train.txt checksum mismatch: {train_hash}. Aborting to protect benchmark integrity.")
+
+    base_lr = args.base_lr
+    num_classes = args.num_classes
+    batch_size = args.batch_size
+    effective_batch_size = getattr(args, "effective_batch_size", 16) or 16
+    accum_steps = max(1, effective_batch_size // batch_size)
+
+    logging.info(f"Configuration: batch_size={batch_size}, accum_steps={accum_steps}, effective_batch_size={batch_size * accum_steps}")
+    logging.info(f"Protocol: max_epochs={args.max_epochs}, num_classes={num_classes}, base_lr={base_lr}, dice_param={args.dice_param}")
+
+    db_train = MyopsDataset(
+        base_dir=args.root_path,
+        list_dir=args.list_dir,
+        split="train",
+        transform=RandomGenerator(output_size=[args.img_size, args.img_size], low_res=[low_res, low_res]),
+        label_order="legacy"
+    )
+    logging.info(f"Loaded MyoPS-380 train dataset: {len(db_train)} slices")
+
+    def worker_init_fn(worker_id):
+        random.seed(args.seed + worker_id)
+
+    num_workers = getattr(args, "num_workers", 2)
+    trainloader = DataLoader(
+        db_train, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True,
+        worker_init_fn=worker_init_fn, drop_last=False
+    )
+
+    model.train()
+    ce_loss = CrossEntropyLoss()
+    dice_loss = DiceLoss(num_classes + 1)
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    logging.info(f"Model parameters: total={total_params:,} | trainable(LoRA+Head)={trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+
+    weight_decay = getattr(args, "weight_decay", 0.0001)
+    if args.AdamW:
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=base_lr, betas=(0.9, 0.999), weight_decay=weight_decay)
+    else:
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=base_lr, momentum=0.9, weight_decay=weight_decay)
+
+    writer = SummaryWriter(os.path.join(snapshot_path, "tensorboard"))
+    max_epochs = args.max_epochs
+    total_updates = max_epochs * math.ceil(len(trainloader) / accum_steps)
+    logging.info(f"Total updates: {total_updates} over {max_epochs} epochs ({len(trainloader)} batches/epoch)")
+
+    checkpoints_dir = os.path.join(snapshot_path, "checkpoints")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
+    update_step = 0
+    group_samples = 0
+
+    for epoch_num in range(max_epochs):
+        epoch_start_time = time.time()
+        epoch_loss = 0.0
+        epoch_loss_ce = 0.0
+        epoch_loss_dice = 0.0
+        batch_count_total = 0
+
+        optimizer.zero_grad(set_to_none=True)
+        group_samples = 0
+
+        for i_batch, sampled_batch in enumerate(trainloader):
+            image_batch = sampled_batch["image"].cuda()
+            low_res_label_batch = sampled_batch["low_res_label"].cuda()
+
+            outputs = model(image_batch, multimask_output, args.img_size)
+            loss, loss_ce, loss_dice = calc_loss(outputs, low_res_label_batch, ce_loss, dice_loss, args.dice_param)
+
+            curr_bs = image_batch.shape[0]
+            (loss * curr_bs).backward()
+            group_samples += curr_bs
+
+            epoch_loss += loss.item() * curr_bs
+            epoch_loss_ce += loss_ce.item() * curr_bs
+            epoch_loss_dice += loss_dice.item() * curr_bs
+            batch_count_total += curr_bs
+
+            is_boundary = ((i_batch + 1) % accum_steps == 0) or ((i_batch + 1) == len(trainloader))
+            if is_boundary:
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.div_(group_samples)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                group_samples = 0
+                update_step += 1
+
+                # Learning rate schedule: Warmup + Polynomial Decay
+                if args.warmup and update_step < args.warmup_period:
+                    curr_lr = base_lr * (update_step / args.warmup_period)
+                else:
+                    shift = args.warmup_period if args.warmup else 0
+                    curr_lr = base_lr * (max(0.0, 1.0 - (update_step - shift) / (total_updates - shift))) ** 0.9
+
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = curr_lr
+
+        epoch_duration = time.time() - epoch_start_time
+        avg_loss = epoch_loss / batch_count_total
+        avg_ce = epoch_loss_ce / batch_count_total
+        avg_dice = epoch_loss_dice / batch_count_total
+
+        writer.add_scalar("train/loss", avg_loss, epoch_num + 1)
+        writer.add_scalar("train/ce", avg_ce, epoch_num + 1)
+        writer.add_scalar("train/dice_loss", avg_dice, epoch_num + 1)
+        writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], epoch_num + 1)
+
+        logging.info(f"Epoch {epoch_num+1}/{max_epochs} | loss: {avg_loss:.4f} | ce: {avg_ce:.4f} | dice_loss: {avg_dice:.4f} | lr: {optimizer.param_groups[0]['lr']:.6f} | time: {epoch_duration:.1f}s")
+
+        # Save last checkpoint (atomically overwrite every epoch)
+        last_lora_path = os.path.join(checkpoints_dir, "last_lora.pth")
+        try:
+            model.save_lora_parameters(last_lora_path)
+        except Exception:
+            model.module.save_lora_parameters(last_lora_path)
+
+        full_ckpt = {
+            "epoch": epoch_num + 1,
+            "model": model.module.state_dict() if hasattr(model, "module") else model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "args": vars(args)
+        }
+        torch.save(full_ckpt, os.path.join(checkpoints_dir, "last.pth"))
+        torch.save(full_ckpt, os.path.join(checkpoints_dir, "last.pt"))
+
+    writer.close()
+    logging.info(f"Training completed {max_epochs} epochs! Final checkpoint saved to {checkpoints_dir}")
     return "Training Finished!"

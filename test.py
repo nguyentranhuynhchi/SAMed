@@ -5,7 +5,6 @@ import logging
 import numpy as np
 import argparse
 import random
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
@@ -13,8 +12,7 @@ from utils import test_single_volume
 from importlib import import_module
 from segment_anything import sam_model_registry
 from datasets.dataset_synapse import Synapse_dataset
-
-from icecream import ic
+import evaluate
 
 
 class_to_name = {1: 'spleen', 2: 'right kidney', 3: 'left kidney', 4: 'gallbladder', 5: 'liver', 6: 'stomach', 7: 'aorta', 8: 'pancreas'}
@@ -61,28 +59,47 @@ def config_to_dict(config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default=None, help='The config file provided by the trained model')
-    parser.add_argument('--volume_path', type=str, default='testset/test_vol_h5/')
-    parser.add_argument('--dataset', type=str, default='Synapse', help='Experiment name')
-    parser.add_argument('--num_classes', type=int, default=8)
-    parser.add_argument('--list_dir', type=str, default='./lists/lists_Synapse/', help='list_dir')
-    parser.add_argument('--output_dir', type=str, default='/output')
+    parser.add_argument('--volume_path', type=str, default='/content/MyoPS380/Processed_data')
+    parser.add_argument('--root_path', type=str, default=None, help='Alias for volume_path')
+    parser.add_argument('--dataset', type=str, default='MyoPS380', choices=['Synapse', 'MyoPS380'], help='Experiment name')
+    parser.add_argument('--num_classes', type=int, default=4)
+    parser.add_argument('--list_dir', type=str, default='./lists/lists_MyoPS380', help='list_dir')
+    parser.add_argument('--output_dir', type=str, default='./outputs/sam/results/SAMed_test')
     parser.add_argument('--img_size', type=int, default=512, help='Input image size of the network')
     parser.add_argument('--input_size', type=int, default=224, help='The input size for training SAM model')
-    parser.add_argument('--seed', type=int,
-                        default=1234, help='random seed')
+    parser.add_argument('--batch_size', type=int, default=8, help='Inference batch size')
+    parser.add_argument('--seed', type=int, default=1234, help='random seed')
     parser.add_argument('--is_savenii', action='store_true', help='Whether to save results during inference')
     parser.add_argument('--deterministic', type=int, default=1, help='whether use deterministic training')
-    parser.add_argument('--ckpt', type=str, default='checkpoints/sam_vit_b_01ec64.pth',
-                        help='Pretrained checkpoint')
-    parser.add_argument('--lora_ckpt', type=str, default='checkpoints/epoch_159.pth', help='The checkpoint from LoRA')
+    parser.add_argument('--ckpt', type=str, default='checkpoints/sam_vit_b_01ec64.pth', help='Pretrained checkpoint')
+    parser.add_argument('--lora_ckpt', type=str, default=None, help='The checkpoint from LoRA')
     parser.add_argument('--vit_name', type=str, default='vit_b', help='Select one vit model')
     parser.add_argument('--rank', type=int, default=4, help='Rank for LoRA adaptation')
     parser.add_argument('--module', type=str, default='sam_lora_image_encoder')
 
     args = parser.parse_args()
 
+    if args.dataset == 'MyoPS380':
+        # Delegate to the MyoPS-380 benchmark evaluation protocol
+        sys.argv = [
+            'evaluate.py',
+            '--root_path', args.root_path or args.volume_path,
+            '--list_dir', args.list_dir,
+            '--output_dir', args.output_dir,
+            '--lora_ckpt', args.lora_ckpt,
+            '--ckpt', args.ckpt,
+            '--vit_name', args.vit_name,
+            '--rank', str(args.rank),
+            '--module', args.module,
+            '--img_size', str(args.img_size),
+            '--num_classes', str(args.num_classes),
+            '--batch_size', str(args.batch_size),
+        ]
+        evaluate.main()
+        sys.exit(0)
+
+    # Fallback to Synapse
     if args.config is not None:
-        # overwtite default configurations with config file\
         config_dict = config_to_dict(args.config)
         for key in config_dict:
             setattr(args, key, config_dict[key])
@@ -110,11 +127,10 @@ if __name__ == '__main__':
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    # register model
     sam, img_embedding_size = sam_model_registry[args.vit_name](image_size=args.img_size,
-                                                                    num_classes=args.num_classes,
-                                                                    checkpoint=args.ckpt, pixel_mean=[0, 0, 0],
-                                                                    pixel_std=[1, 1, 1])
+                                                                num_classes=args.num_classes,
+                                                                checkpoint=args.ckpt, pixel_mean=[0, 0, 0],
+                                                                pixel_std=[1, 1, 1])
     
     pkg = import_module(args.module)
     net = pkg.LoRA_Sam(sam, args.rank).cuda()
@@ -127,12 +143,11 @@ if __name__ == '__main__':
     else:
         multimask_output = False
 
-    # initialize log
     log_folder = os.path.join(args.output_dir, 'test_log')
     os.makedirs(log_folder, exist_ok=True)
     logging.basicConfig(filename=log_folder + '/' + 'log.txt', level=logging.INFO,
                         format='[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%H:%M:%S')
-    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+    logging.getLogger().addHandler(console if 'console' in locals() else logging.StreamHandler(sys.stdout))
     logging.info(str(args))
 
     if args.is_savenii:
