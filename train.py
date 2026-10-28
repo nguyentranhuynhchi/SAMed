@@ -36,6 +36,8 @@ parser.add_argument('--effective_batch_size', type=int,
                     default=16, help='target effective batch size using accumulation')
 parser.add_argument('--num_workers', type=int,
                     default=2, help='number of dataloader workers')
+parser.add_argument('--cpu_threads', type=int,
+                    default=2, help='torch cpu threads')
 parser.add_argument('--weight_decay', type=float,
                     default=0.0001, help='AdamW weight decay')
 parser.add_argument('--n_gpu', type=int, default=1, help='total gpu')
@@ -64,6 +66,7 @@ parser.add_argument('--dice_param', type=float, default=0.8)
 args = parser.parse_args()
 
 if __name__ == "__main__":
+    torch.set_num_threads(args.cpu_threads)
     if not args.deterministic:
         cudnn.benchmark = True
         cudnn.deterministic = False

@@ -44,6 +44,7 @@ def build_parser():
     parser.add_argument("--img_size", type=int, default=512, help="Network input image size")
     parser.add_argument("--num_classes", type=int, default=4, help="Number of segmentation classes")
     parser.add_argument("--batch_size", type=int, default=8, help="Inference batch size of slices")
+    parser.add_argument("--cpu_threads", type=int, default=2, help="torch cpu threads")
     parser.add_argument("--device", type=str, default="cuda", help="Inference device")
     return parser
 
@@ -100,6 +101,7 @@ def predict_test_volume(
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    torch.set_num_threads(args.cpu_threads)
 
     output_dir = Path(args.output_dir)
     test_results_dir = output_dir / "test_results"

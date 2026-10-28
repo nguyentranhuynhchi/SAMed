@@ -37,6 +37,7 @@ python train.py \
     --batch_size "$BATCH_SIZE" \
     --effective_batch_size 16 \
     --num_workers 2 \
+    --cpu_threads 2 \
     --base_lr 0.005 \
     --warmup \
     --AdamW \
@@ -53,6 +54,7 @@ python evaluate.py \
     --ckpt "$CKPT" \
     --img_size "$IMG_SIZE" \
     --num_classes 4 \
+    --cpu_threads 2 \
     --batch_size 8
 
 # 4. Package results zip
