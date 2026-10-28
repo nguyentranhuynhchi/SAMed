@@ -189,7 +189,8 @@ def trainer_myops(args, model, snapshot_path, multimask_output, low_res):
 
     model.train()
     ce_loss = CrossEntropyLoss()
-    dice_loss = DiceLoss(num_classes + 1)
+    # For MyoPS-380 (num_classes=4), model outputs exactly 4 channels (0: BG, 1: Myo, 2: Edema, 3: Scar)
+    dice_loss = DiceLoss(num_classes)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
@@ -274,9 +275,12 @@ def trainer_myops(args, model, snapshot_path, multimask_output, low_res):
         # Save last checkpoint (atomically overwrite every epoch)
         last_lora_path = os.path.join(checkpoints_dir, "last_lora.pth")
         try:
-            model.save_lora_parameters(last_lora_path)
-        except Exception:
-            model.module.save_lora_parameters(last_lora_path)
+            if hasattr(model, "module"):
+                model.module.save_lora_parameters(last_lora_path)
+            else:
+                model.save_lora_parameters(last_lora_path)
+        except Exception as e:
+            logging.error(f"Failed to save lora parameters to {last_lora_path}: {e}")
 
         full_ckpt = {
             "epoch": epoch_num + 1,

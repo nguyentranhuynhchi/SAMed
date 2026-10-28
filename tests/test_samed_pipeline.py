@@ -97,9 +97,11 @@ class TestSAMedPipeline(unittest.TestCase):
             self.skipTest(f"Skipping model test on CPU host without torchvision/dependencies: {e}")
 
         img_size = 224
+        num_classes = 4
+        num_multimask = num_classes - 1  # 3 foreground classes -> 4 total channels (0: BG, 1: Myo, 2: Edema, 3: Scar)
         sam, img_embedding_size = sam_model_registry["vit_b"](
             image_size=img_size,
-            num_classes=4,
+            num_classes=num_multimask,
             checkpoint=None,
             pixel_mean=[0, 0, 0],
             pixel_std=[1, 1, 1]
@@ -117,11 +119,12 @@ class TestSAMedPipeline(unittest.TestCase):
         self.assertIn("masks", outputs)
         self.assertIn("low_res_logits", outputs)
         self.assertEqual(outputs["masks"].shape, (2, 4, img_size, img_size))
+        self.assertEqual(outputs["low_res_logits"].shape, (2, 4, img_embedding_size * 4, img_embedding_size * 4))
 
         low_res = img_embedding_size * 4
         y_low_res = torch.randint(0, 4, (2, low_res, low_res))
         ce = CrossEntropyLoss()
-        dice = DiceLoss(4 + 1)
+        dice = DiceLoss(num_classes)
         loss, loss_ce, loss_dice = calc_loss(outputs, y_low_res, ce, dice, dice_weight=0.8)
 
         self.assertTrue(torch.isfinite(loss))

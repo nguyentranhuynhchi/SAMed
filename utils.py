@@ -1,13 +1,30 @@
 import os
 import numpy as np
 import torch
-from medpy import metric
 from scipy.ndimage import zoom
 import torch.nn as nn
-import SimpleITK as sitk
 import torch.nn.functional as F
-import imageio
-from einops import repeat
+
+try:
+    from medpy import metric
+except ImportError:
+    metric = None
+
+try:
+    import SimpleITK as sitk
+except ImportError:
+    sitk = None
+
+try:
+    import imageio
+except ImportError:
+    imageio = None
+
+try:
+    from einops import repeat
+except ImportError:
+    repeat = None
+
 from icecream import ic
 
 

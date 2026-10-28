@@ -122,10 +122,11 @@ def main():
     logging.info(f"Data Root: {args.root_path}")
     logging.info(f"List Dir: {args.list_dir}")
 
-    # Build SAMed model
+    # Build SAMed model: pass num_classes - 1 (3 foreground + 1 bg token = 4 channels)
+    num_multimask = args.num_classes - 1
     sam, _ = sam_model_registry[args.vit_name](
         image_size=args.img_size,
-        num_classes=args.num_classes,
+        num_classes=num_multimask,
         checkpoint=args.ckpt,
         pixel_mean=[0, 0, 0],
         pixel_std=[1, 1, 1]
@@ -135,21 +136,27 @@ def main():
     model = pkg.LoRA_Sam(sam, args.rank)
 
     # Load weights
-    if os.path.isfile(args.lora_ckpt):
-        logging.info(f"Loading checkpoint weights from {args.lora_ckpt}")
-        ckpt_data = torch.load(args.lora_ckpt, map_location="cpu")
-        if "model" in ckpt_data and isinstance(ckpt_data["model"], dict):
-            # Full state dict
-            model.load_state_dict(ckpt_data["model"], strict=False)
+    ckpt_path = Path(args.lora_ckpt)
+    if not ckpt_path.is_file():
+        alt_path = ckpt_path.parent / "last.pth"
+        if alt_path.is_file():
+            logging.warning(f"Checkpoint {ckpt_path} not found, falling back to {alt_path}")
+            ckpt_path = alt_path
         else:
-            # LoRA state dict
-            try:
-                model.load_lora_parameters(args.lora_ckpt)
-            except Exception as e:
-                logging.warning(f"load_lora_parameters failed ({e}), attempting direct load_state_dict...")
-                model.load_state_dict(ckpt_data, strict=False)
+            raise FileNotFoundError(f"Checkpoint not found: {args.lora_ckpt}")
+
+    logging.info(f"Loading checkpoint weights from {ckpt_path}")
+    ckpt_data = torch.load(str(ckpt_path), map_location="cpu")
+    if "model" in ckpt_data and isinstance(ckpt_data["model"], dict):
+        # Full state dict
+        model.load_state_dict(ckpt_data["model"], strict=False)
     else:
-        raise FileNotFoundError(f"Checkpoint not found: {args.lora_ckpt}")
+        # LoRA state dict
+        try:
+            model.load_lora_parameters(str(ckpt_path))
+        except Exception as e:
+            logging.warning(f"load_lora_parameters failed ({e}), attempting direct load_state_dict...")
+            model.load_state_dict(ckpt_data, strict=False)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     model = model.to(device)

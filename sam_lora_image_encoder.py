@@ -8,8 +8,12 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn.parameter import Parameter
 from segment_anything.modeling import Sam
-from safetensors import safe_open
-from safetensors.torch import save_file
+try:
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+except ImportError:
+    safe_open = None
+    save_file = None
 
 from icecream import ic
 

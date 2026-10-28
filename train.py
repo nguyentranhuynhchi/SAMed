@@ -98,10 +98,12 @@ if __name__ == "__main__":
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
 
-    # register model
+    # register model: pass number of foreground classes (num_classes - 1 for MyoPS380)
+    # SAMed mask decoder adds 1 background token: total tokens = num_multimask + 1 = 4 channels
+    num_multimask = args.num_classes - 1 if args.dataset == 'MyoPS380' else args.num_classes
     sam, img_embedding_size = sam_model_registry[args.vit_name](
         image_size=args.img_size,
-        num_classes=args.num_classes,
+        num_classes=num_multimask,
         checkpoint=args.ckpt,
         pixel_mean=[0, 0, 0],
         pixel_std=[1, 1, 1]

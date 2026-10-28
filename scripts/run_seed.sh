@@ -60,9 +60,7 @@ python evaluate.py \
 # 4. Package results zip
 ZIP_NAME="/content/SAMed_Seed_${SEED}_Results.zip"
 echo "[SAMed] Packaging results to $ZIP_NAME..."
-cd "$RUN_DIR"
-zip -r "$ZIP_NAME" test_results/ test_predictions/ train.log config.txt checkpoints/last_lora.pth checkpoints/last.pth
-cd -
+(cd "$RUN_DIR" && zip -r -q "$ZIP_NAME" .)
 
 echo "=========================================================="
 echo " Completed SAMed Seed ${SEED} successfully!"

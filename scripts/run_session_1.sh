@@ -5,7 +5,10 @@ echo "=========================================================="
 echo "🚀 STARTING SAMED BENCHMARK SESSION 1: Seeds 1234, 1098, 1024"
 echo "=========================================================="
 
-# 1. Tải Dataset MyoPS-380 nếu chưa có
+# 1. Cài đặt các gói bổ trợ
+pip install -q icecream tensorboardX gdown medpy SimpleITK einops safetensors
+
+# 2. Tải Dataset MyoPS-380 nếu chưa có
 LOCAL_DATASET="/content/MyoPS380_dataset/Processed_data"
 if [ ! -d "$LOCAL_DATASET" ]; then
     echo "📥 Đang tải Dataset MyoPS-380..."
@@ -14,7 +17,7 @@ if [ ! -d "$LOCAL_DATASET" ]; then
     unzip -q -o /content/MyoPS380_dataset.zip -d /content/MyoPS380_dataset/
 fi
 
-# 2. Tải SAM ViT-B pretrained weights nếu chưa có
+# 3. Tải SAM ViT-B pretrained weights nếu chưa có
 CKPT="checkpoints/sam_vit_b_01ec64.pth"
 mkdir -p checkpoints
 if [ ! -f "$CKPT" ]; then
@@ -24,7 +27,7 @@ fi
 
 export OMP_NUM_THREADS=2
 
-# 3. Chạy song song 3 Seed trên GPU A100
+# 4. Chạy song song 3 Seed trên GPU A100
 echo "🔥 Bắt đầu Train SONG SONG 3 Seed: 1234, 1098, 1024..."
 bash scripts/run_seed.sh 1234 512 8 2 "$LOCAL_DATASET" > train_1234.log 2>&1 &
 bash scripts/run_seed.sh 1098 512 8 2 "$LOCAL_DATASET" > train_1098.log 2>&1 &
