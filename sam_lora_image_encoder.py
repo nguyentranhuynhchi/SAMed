@@ -11,7 +11,10 @@ from segment_anything.modeling import Sam
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from icecream import ic
+try:
+    from icecream import ic
+except ImportError:
+    ic = lambda *args: args[0] if len(args) == 1 else args
 
 
 class _LoRA_qkv(nn.Module):

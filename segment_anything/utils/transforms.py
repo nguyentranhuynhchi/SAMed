@@ -7,7 +7,10 @@
 import numpy as np
 import torch
 from torch.nn import functional as F
-from torchvision.transforms.functional import resize, to_pil_image  # type: ignore
+try:
+    from torchvision.transforms.functional import resize, to_pil_image  # type: ignore
+except ImportError:
+    resize = to_pil_image = None
 
 from copy import deepcopy
 from typing import Tuple

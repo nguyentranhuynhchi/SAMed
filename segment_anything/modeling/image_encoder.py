@@ -7,7 +7,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from icecream import ic
+try:
+    from icecream import ic
+except ImportError:
+    ic = lambda *args: args[0] if len(args) == 1 else args
 
 from typing import Optional, Tuple, Type
 

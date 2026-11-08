@@ -6,7 +6,10 @@
 
 import torch
 from torch.nn import functional as F
-from icecream import ic
+try:
+    from icecream import ic
+except ImportError:
+    ic = lambda *args: args[0] if len(args) == 1 else args
 
 from functools import partial
 
@@ -127,11 +130,14 @@ def _build_sam(
     # sam.eval()
     sam.train()
     if checkpoint is not None:
+        import os
+        if not os.path.exists(checkpoint):
+            raise FileNotFoundError(f"SAM checkpoint file not found: {checkpoint}")
         with open(checkpoint, "rb") as f:
-            state_dict = torch.load(f)
+            state_dict = torch.load(f, map_location="cpu", weights_only=False)
         try:
             sam.load_state_dict(state_dict)
-        except:
+        except Exception:
             new_state_dict = load_from(sam, state_dict, image_size, vit_patch_size)
             sam.load_state_dict(new_state_dict)
     return sam, image_embedding_size
@@ -142,21 +148,23 @@ def load_from(sam, state_dict, image_size, vit_patch_size):
     except_keys = ['mask_tokens', 'output_hypernetworks_mlps', 'iou_prediction_head']
     new_state_dict = {k: v for k, v in state_dict.items() if
                       k in sam_dict.keys() and except_keys[0] not in k and except_keys[1] not in k and except_keys[2] not in k}
-    pos_embed = new_state_dict['image_encoder.pos_embed']
+    pos_embed = new_state_dict.get('image_encoder.pos_embed')
     token_size = int(image_size // vit_patch_size)
-    if pos_embed.shape[1] != token_size:
+    if pos_embed is not None and pos_embed.shape[1] != token_size:
         # resize pos embedding, which may sacrifice the performance, but I have no better idea
         pos_embed = pos_embed.permute(0, 3, 1, 2)  # [b, c, h, w]
         pos_embed = F.interpolate(pos_embed, (token_size, token_size), mode='bilinear', align_corners=False)
         pos_embed = pos_embed.permute(0, 2, 3, 1)  # [b, h, w, c]
         new_state_dict['image_encoder.pos_embed'] = pos_embed
         rel_pos_keys = [k for k in sam_dict.keys() if 'rel_pos' in k]
-        global_rel_pos_keys = [k for k in rel_pos_keys if '2' in k or '5' in  k or '8' in k or '11' in k]
+        global_indexes = getattr(sam.image_encoder, 'global_attn_indexes', [2, 5, 8, 11])
+        global_rel_pos_keys = [k for k in rel_pos_keys if any(f".{idx}." in k for idx in global_indexes)]
         for k in global_rel_pos_keys:
-            rel_pos_params = new_state_dict[k]
-            h, w = rel_pos_params.shape
-            rel_pos_params = rel_pos_params.unsqueeze(0).unsqueeze(0)
-            rel_pos_params = F.interpolate(rel_pos_params, (token_size * 2 - 1, w), mode='bilinear', align_corners=False)
-            new_state_dict[k] = rel_pos_params[0, 0, ...]
+            if k in new_state_dict:
+                rel_pos_params = new_state_dict[k]
+                h, w = rel_pos_params.shape
+                rel_pos_params = rel_pos_params.unsqueeze(0).unsqueeze(0)
+                rel_pos_params = F.interpolate(rel_pos_params, (token_size * 2 - 1, w), mode='bilinear', align_corners=False)
+                new_state_dict[k] = rel_pos_params[0, 0, ...]
     sam_dict.update(new_state_dict)
     return sam_dict
