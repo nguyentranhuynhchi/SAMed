@@ -60,13 +60,15 @@ NO_VAL_PROTOCOL = {
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--data_root", "--data-root", default="/content/MyoPS380_dataset/Processed_data",
+    parser.add_argument("--data_root", "--data-root",
+                        default=os.environ.get("MYOPS380_DATA_ROOT", "/content/MyoPS380_dataset/Processed_data"),
                         help="Root folder containing bSSFP, LGE, T2w subdirectories")
     parser.add_argument("--list_dir", "--list-dir", default=str(PROJECT_ROOT / "lists" / "myops380_no_val"),
                         help="Directory containing train.txt and test_vol.txt")
     parser.add_argument("--output_dir", "--output-dir", "--run_dir", default=None,
                         help="Run output directory; defaults to runs/samed_seed<seed>")
     parser.add_argument("--model_id", default="samed", help="Canonical lowercase model ID")
+    parser.add_argument("--dataset_id", "--dataset-id", default="myops380", help="Dataset identifier")
     parser.add_argument("--vit_name", default="vit_b", choices=["vit_b", "vit_l", "vit_h"], help="ViT backbone variant")
     parser.add_argument("--ckpt", default="checkpoints/sam_vit_b_01ec64.pth", help="Pretrained SAM weights path")
     parser.add_argument("--lora_ckpt", default=None, help="Optional checkpoint to initialize LoRA weights")
@@ -410,6 +412,7 @@ def main(argv=None):
         is_complete = (epoch + 1 == args.max_epochs)
         parsed_args = vars(args).copy()
         parsed_args["no_val"] = True
+        parsed_args["dataset_id"] = args.dataset_id
 
         checkpoint_payload = {
             "epoch": epoch,

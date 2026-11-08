@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -40,13 +41,15 @@ from utils.metrics import (
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--checkpoint", required=True, help="Path to samed_seed<seed>.pt checkpoint")
-    parser.add_argument("--data_root", "--data-root", default="/content/MyoPS380_dataset/Processed_data",
+    parser.add_argument("--data_root", "--data-root",
+                        default=os.environ.get("MYOPS380_DATA_ROOT", "/content/MyoPS380_dataset/Processed_data"),
                         help="Root folder containing bSSFP, LGE, T2w subdirectories")
     parser.add_argument("--list_dir", "--list-dir", default=str(PROJECT_ROOT / "lists" / "myops380_no_val"),
                         help="Directory containing test_vol.txt")
     parser.add_argument("--output_dir", "--output-dir", default=None,
                         help="Evaluation output directory; defaults to checkpoint run directory")
     parser.add_argument("--split", default="test_vol", help="Split name to evaluate (default: test_vol)")
+    parser.add_argument("--dataset_id", "--dataset-id", default="myops380", help="Dataset identifier")
     parser.add_argument("--batch_size", "--batch-size", type=int, default=8, help="Inference slices per batch")
     parser.add_argument("--device", default="auto", help="Device (auto, cuda, cpu)")
     parser.add_argument("--amp", choices=["auto", "none", "fp16", "bf16"], default="auto", help="AMP mode")
@@ -201,10 +204,11 @@ def main(argv=None):
     total_seconds = 0.0
     total_slices = 0
 
+    checkpoint_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
     for sample in dataset:
         case = sample["case_name"]
         images = [sample["image"], sample["image1"], sample["image2"]]
-        target = np.asarray(sample["label"])  # Already Canonicalized in memory
+        target = np.asarray(sample["label"]) if sample["label"] is not None else None
 
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -225,20 +229,25 @@ def main(argv=None):
         total_seconds += elapsed
         total_slices += prediction.shape[2]
 
-        case_rows = dataset_rows(prediction, target, case, compute_distance=True, dataset_id="myops380")
-        for r in case_rows:
-            r["inference_seconds"] = elapsed
-        rows.extend(case_rows)
+        if target is not None:
+            case_rows = dataset_rows(prediction, target, case, compute_distance=True, dataset_id=args.dataset_id)
+            for r in case_rows:
+                r["inference_seconds"] = elapsed
+            rows.extend(case_rows)
+        else:
+            case_rows = []
 
         if args.save_predictions:
             np.savez_compressed(
                 pred_dir / f"{case}_pred.npz",
                 prediction=prediction,
                 class_names=np.asarray(CLASS_NAMES),
-                spacing=np.asarray(sample.get("spacing", [1.0, 1.0, 1.0])),
-                affine=np.asarray(sample.get("affine", np.eye(4))),
+                spacing=np.asarray(sample.get("spacing", [np.nan, np.nan, np.nan])),
+                affine=np.asarray(sample.get("affine", np.full((4, 4), np.nan))),
                 spacing_unit=sample.get("spacing_unit", "voxel"),
                 metric_distance_unit="voxel",
+                exported_label_order="canonical",
+                adapter_version="canonical_v1",
             )
             if sample.get("has_affine", False):
                 try:
@@ -257,28 +266,32 @@ def main(argv=None):
                 f"Precision={r['precision']} Recall={r['recall']} HD95={r['hd95_voxel']} ASD={r['asd_voxel']}"
             )
 
-    if not rows:
+    if not rows and any(s["label"] is not None for s in dataset):
         raise ValueError("No evaluation results were generated.")
 
     # Save per_case.csv
-    csv_path = output_dir / "per_case.csv"
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-    logging.info(f"Saved per-case metrics to: {csv_path}")
+    if rows:
+        csv_path = output_dir / "per_case.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        logging.info(f"Saved per-case metrics to: {csv_path}")
 
     # Summarize metrics
-    summary = summarize_dataset_rows(rows, dataset_id="myops380")
+    summary = summarize_dataset_rows(rows, dataset_id=args.dataset_id) if rows else {}
     summary.update({
         "model_name": "SAMed",
         "model_id": "samed",
+        "dataset_id": args.dataset_id,
         "checkpoint": str(checkpoint_path),
+        "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_epoch": completed_epochs,
         "planned_epochs": planned_epochs,
         "training_complete": training_complete,
         "training_protocol": training_protocol,
         "metric_protocol": BENCHMARK_PROTOCOL["id"],
+        "exported_label_order": "canonical",
         "total_cases": len(dataset),
         "total_slices": total_slices,
         "total_inference_time_sec": total_seconds,

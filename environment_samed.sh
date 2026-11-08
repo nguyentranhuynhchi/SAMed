@@ -55,27 +55,43 @@ echo "=== [4/6] Cài đặt Dependencies cho SAMed ==="
 python3 -m pip install --upgrade pip -q
 python3 -m pip install -r requirements.txt gdown -q
 
-echo "=== [5/6] Chuẩn bị Pretrained SAM Backbone Checkpoint (sam_vit_b_01ec64.pth) ==="
+echo "=== [5/7] Chuẩn bị Pretrained SAM Backbone Checkpoint (sam_vit_b_01ec64.pth) ==="
 mkdir -p /content/SAMed/checkpoints
 CKPT_FILE="/content/SAMed/checkpoints/sam_vit_b_01ec64.pth"
-DRIVE_CKPT="/content/drive/MyDrive/SAMed/checkpoints/sam_vit_b_01ec64.pth"
 
 if [ -s "$CKPT_FILE" ]; then
     echo "✅ Checkpoint đã có sẵn tại: $CKPT_FILE"
-elif [ -s "$DRIVE_CKPT" ]; then
-    echo "Đang sao chép checkpoint từ Google Drive đã mount..."
-    cp "$DRIVE_CKPT" "$CKPT_FILE"
-    echo "✅ Sao chép checkpoint từ Google Drive thành công!"
 else
-    echo "Đang tải sam_vit_b_01ec64.pth từ server chính thức Meta..."
-    wget -c -O "$CKPT_FILE" https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth || {
-        echo "Tải trực tiếp thất bại, thử tải qua gdown từ Drive dự phòng..."
-        gdown --id "1j_n2fWbCjL6fW77oFmEw47J56P8nC_mP" -O "$CKPT_FILE" || true
-    }
-    echo "✅ Tải SAM backbone checkpoint hoàn tất!"
+    # Tìm kiếm checkpoint nếu đã có sẵn trên Google Drive để copy trực tiếp
+    for CANDIDATE in \
+        "/content/drive/MyDrive/SAMed/checkpoints/sam_vit_b_01ec64.pth" \
+        "/content/drive/MyDrive/sam_vit_b_01ec64.pth" \
+        "/content/drive/MyDrive/NCKH/SAMed/checkpoints/sam_vit_b_01ec64.pth" \
+        "/content/drive/MyDrive/NCKH_V2/SAMed/checkpoints/sam_vit_b_01ec64.pth" \
+        "/content/drive/MyDrive/checkpoints/sam_vit_b_01ec64.pth"; do
+        if [ -s "$CANDIDATE" ]; then
+            echo "✅ Tìm thấy checkpoint trên Drive: $CANDIDATE. Đang sao chép..."
+            cp "$CANDIDATE" "$CKPT_FILE"
+            break
+        fi
+    done
 fi
 
-echo "=== [6/6] Tải Dataset MyoPS380 từ Google Drive ==="
+if [ ! -s "$CKPT_FILE" ]; then
+    echo "Đang tải sam_vit_b_01ec64.pth từ server chính thức Meta..."
+    wget -c -O "$CKPT_FILE" https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth || {
+        echo "Tải trực tiếp thất bại, dọn dẹp file dở dang và tải qua gdown từ Drive dự phòng..."
+        rm -f "$CKPT_FILE"
+        gdown --id "1j_n2fWbCjL6fW77oFmEw47J56P8nC_mP" -O "$CKPT_FILE" || true
+    }
+fi
+if [ -s "$CKPT_FILE" ]; then
+    echo "✅ Checkpoint sẵn sàng tại: $CKPT_FILE"
+else
+    echo "⚠️ CẢNH BÁO: Chưa tải được SAM backbone checkpoint. Kiểm tra lại kết nối mạng!"
+fi
+
+echo "=== [6/7] Tải Dataset MyoPS380 từ Google Drive ==="
 DATASET_FOLDER_ID="13T6892xy-pUwC1BSjGl4sRxoypMu-SIS"
 DOWNLOAD_DIR="/content/dataset_download"
 TARGET_DATASET_DIR="/content/MyoPS380_dataset"
@@ -122,7 +138,12 @@ else
     echo "⚠️ Chưa phát hiện thư mục bSSFP, đặt mặc định: $LOCAL_DATASET"
 fi
 
-echo "=== Cài đặt tmux và Kiểm tra PyTorch ==="
+export MYOPS380_DATA_ROOT="$LOCAL_DATASET"
+if ! grep -q "MYOPS380_DATA_ROOT" /root/.bashrc 2>/dev/null; then
+    echo "export MYOPS380_DATA_ROOT=\"$LOCAL_DATASET\"" >> /root/.bashrc
+fi
+
+echo "=== [7/7] Cài đặt tmux và Kiểm tra PyTorch ==="
 command -v tmux &> /dev/null || (apt-get update -qq && apt-get install -y tmux)
 python3 -c "import torch; print(f'PyTorch: {torch.__version__} | CUDA: {torch.cuda.is_available()} | GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"None\"}')"
 
