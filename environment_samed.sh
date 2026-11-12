@@ -79,38 +79,51 @@ else
     done
 fi
 
+EXPECTED_SAM_SHA256="ec2df62732614e57411cdcf32a23ffdf28910380d03139ee0f4fcbe91eb8c912"
+
+verify_sam_ckpt() {
+    local ckpt="$1"
+    [ -s "$ckpt" ] || return 1
+    local actual_sha
+    actual_sha=$(python3 -c "import hashlib,sys; h=hashlib.sha256(); f=open(sys.argv[1],'rb'); [h.update(b) for b in iter(lambda: f.read(1048576), b'')]; print(h.hexdigest().lower())" "$ckpt" 2>/dev/null || true)
+    if [ "$actual_sha" = "$EXPECTED_SAM_SHA256" ]; then
+        return 0
+    fi
+    echo "⚠️ SHA-256 không khớp ($actual_sha != $EXPECTED_SAM_SHA256), xóa file không hợp lệ..."
+    rm -f "$ckpt"
+    return 1
+}
+
+if ! verify_sam_ckpt "$CKPT_FILE"; then
+    for SAM_URL in \
+        "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth" \
+        "https://huggingface.co/scenario-labs/sam_vit/resolve/main/sam_vit_b_01ec64.pth" \
+        "https://huggingface.co/YouLiXiya/YL-SAM/resolve/main/sam_vit_b_01ec64.pth"; do
+        echo "Đang tải sam_vit_b_01ec64.pth từ: $SAM_URL"
+        if command -v curl &> /dev/null; then
+            curl -fL --retry 3 -o "$CKPT_FILE" "$SAM_URL" || rm -f "$CKPT_FILE"
+        elif command -v wget &> /dev/null; then
+            wget -O "$CKPT_FILE" "$SAM_URL" || rm -f "$CKPT_FILE"
+        else
+            python3 -c "import urllib.request; urllib.request.urlretrieve('$SAM_URL', '$CKPT_FILE')" || rm -f "$CKPT_FILE"
+        fi
+        if verify_sam_ckpt "$CKPT_FILE"; then
+            break
+        fi
+    done
+fi
+
 if [ ! -s "$CKPT_FILE" ]; then
-    echo "Đang tải sam_vit_b_01ec64.pth từ server chính thức Meta AI..."
-    SAM_URL="https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-    if command -v curl &> /dev/null; then
-        curl -fL --retry 3 -C - -o "$CKPT_FILE" "$SAM_URL" || rm -f "$CKPT_FILE"
-    fi
-    if [ ! -s "$CKPT_FILE" ] && command -v wget &> /dev/null; then
-        wget -c -O "$CKPT_FILE" "$SAM_URL" || rm -f "$CKPT_FILE"
-    fi
-    if [ ! -s "$CKPT_FILE" ]; then
-        python3 -c "import urllib.request; urllib.request.urlretrieve('$SAM_URL', '$CKPT_FILE')" || rm -f "$CKPT_FILE"
-    fi
-    if [ ! -s "$CKPT_FILE" ]; then
-        echo "Tải trực tiếp từ Meta thất bại, thử fallback qua gdown..."
-        gdown --id "1j_n2fWbCjL6fW77oFmEw47J56P8nC_mP" -O "$CKPT_FILE" || rm -f "$CKPT_FILE"
-    fi
-fi
-
-# Kiểm tra kích thước tối thiểu (>100 MB) để tránh file HTML lỗi giả mạo
-if [ -s "$CKPT_FILE" ]; then
-    CKPT_BYTES=$(wc -c < "$CKPT_FILE")
-    if [ "$CKPT_BYTES" -lt 100000000 ]; then
-        echo "⚠️ File tải về quá nhỏ (${CKPT_BYTES} bytes), xóa file lỗi..."
-        rm -f "$CKPT_FILE"
-    fi
+    echo "Các URL trực tiếp thất bại, thử fallback cuối qua gdown..."
+    gdown --id "1j_n2fWbCjL6fW77oFmEw47J56P8nC_mP" -O "$CKPT_FILE" || rm -f "$CKPT_FILE"
+    verify_sam_ckpt "$CKPT_FILE" || true
 fi
 
 if [ -s "$CKPT_FILE" ]; then
-    echo "✅ Checkpoint sẵn sàng tại: $CKPT_FILE"
+    echo "✅ Checkpoint sẵn sàng & đã khớp SHA-256 Meta AI tại: $CKPT_FILE"
 else
     echo "❌ LỖI: Chưa tải được SAM backbone checkpoint ($CKPT_FILE)."
-    echo "   Hãy kiểm tra kết nối mạng tới dl.fbaipublicfiles.com hoặc tải thủ công sam_vit_b_01ec64.pth vào /content/SAMed/checkpoints/."
+    echo "   Hãy kiểm tra kết nối mạng hoặc tải thủ công sam_vit_b_01ec64.pth vào /content/SAMed/checkpoints/."
     exit 1
 fi
 
