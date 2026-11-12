@@ -80,17 +80,38 @@ else
 fi
 
 if [ ! -s "$CKPT_FILE" ]; then
-    echo "Đang tải sam_vit_b_01ec64.pth từ server chính thức Meta..."
-    wget -c -O "$CKPT_FILE" https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth || {
-        echo "Tải trực tiếp thất bại, dọn dẹp file dở dang và tải qua gdown từ Drive dự phòng..."
-        rm -f "$CKPT_FILE"
-        gdown --id "1j_n2fWbCjL6fW77oFmEw47J56P8nC_mP" -O "$CKPT_FILE" || true
-    }
+    echo "Đang tải sam_vit_b_01ec64.pth từ server chính thức Meta AI..."
+    SAM_URL="https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
+    if command -v curl &> /dev/null; then
+        curl -fL --retry 3 -C - -o "$CKPT_FILE" "$SAM_URL" || rm -f "$CKPT_FILE"
+    fi
+    if [ ! -s "$CKPT_FILE" ] && command -v wget &> /dev/null; then
+        wget -c -O "$CKPT_FILE" "$SAM_URL" || rm -f "$CKPT_FILE"
+    fi
+    if [ ! -s "$CKPT_FILE" ]; then
+        python3 -c "import urllib.request; urllib.request.urlretrieve('$SAM_URL', '$CKPT_FILE')" || rm -f "$CKPT_FILE"
+    fi
+    if [ ! -s "$CKPT_FILE" ]; then
+        echo "Tải trực tiếp từ Meta thất bại, thử fallback qua gdown..."
+        gdown --id "1j_n2fWbCjL6fW77oFmEw47J56P8nC_mP" -O "$CKPT_FILE" || rm -f "$CKPT_FILE"
+    fi
 fi
+
+# Kiểm tra kích thước tối thiểu (>100 MB) để tránh file HTML lỗi giả mạo
+if [ -s "$CKPT_FILE" ]; then
+    CKPT_BYTES=$(wc -c < "$CKPT_FILE")
+    if [ "$CKPT_BYTES" -lt 100000000 ]; then
+        echo "⚠️ File tải về quá nhỏ (${CKPT_BYTES} bytes), xóa file lỗi..."
+        rm -f "$CKPT_FILE"
+    fi
+fi
+
 if [ -s "$CKPT_FILE" ]; then
     echo "✅ Checkpoint sẵn sàng tại: $CKPT_FILE"
 else
-    echo "⚠️ CẢNH BÁO: Chưa tải được SAM backbone checkpoint. Kiểm tra lại kết nối mạng!"
+    echo "❌ LỖI: Chưa tải được SAM backbone checkpoint ($CKPT_FILE)."
+    echo "   Hãy kiểm tra kết nối mạng tới dl.fbaipublicfiles.com hoặc tải thủ công sam_vit_b_01ec64.pth vào /content/SAMed/checkpoints/."
+    exit 1
 fi
 
 echo "=== [6/7] Tải Dataset MyoPS380 từ Google Drive ==="
@@ -135,19 +156,18 @@ if [ ! -d "$TARGET_DATASET_DIR/Processed_data/bSSFP" ]; then
     fi
 fi
 
-FOUND_BSSFP=$(find "$TARGET_DATASET_DIR" "$DOWNLOAD_DIR" -type d -name "bSSFP" 2>/dev/null | head -n 1)
-if [ -n "$FOUND_BSSFP" ]; then
-    LOCAL_DATASET=$(dirname "$FOUND_BSSFP")
-    echo "✅ Đã xác định thư mục dataset chuẩn tại: $LOCAL_DATASET"
+FOUND_TRAIN_NPZ=$(find "$TARGET_DATASET_DIR" "$DOWNLOAD_DIR" -type d -name "train_npz" 2>/dev/null | grep -i "bSSFP" | head -n 1 || true)
+if [ -n "$FOUND_TRAIN_NPZ" ]; then
+    LOCAL_DATASET=$(dirname "$(dirname "$FOUND_TRAIN_NPZ")")
+    echo "✅ Đã xác định thư mục dataset chuẩn (Processed_data) tại: $LOCAL_DATASET"
 else
     LOCAL_DATASET="/content/MyoPS380_dataset/Processed_data"
-    echo "⚠️ Chưa phát hiện thư mục bSSFP, đặt mặc định: $LOCAL_DATASET"
+    echo "⚠️ Chưa phát hiện thư mục bSSFP/train_npz, đặt mặc định: $LOCAL_DATASET"
 fi
 
 export MYOPS380_DATA_ROOT="$LOCAL_DATASET"
-if ! grep -q "MYOPS380_DATA_ROOT" /root/.bashrc 2>/dev/null; then
-    echo "export MYOPS380_DATA_ROOT=\"$LOCAL_DATASET\"" >> /root/.bashrc
-fi
+sed -i '/^export MYOPS380_DATA_ROOT=/d' /root/.bashrc 2>/dev/null || true
+echo "export MYOPS380_DATA_ROOT=\"$LOCAL_DATASET\"" >> /root/.bashrc
 
 echo "=== [7/7] Cài đặt tmux và Kiểm tra PyTorch ==="
 command -v tmux &> /dev/null || (apt-get update -qq && apt-get install -y tmux)
@@ -161,8 +181,8 @@ echo "     tmux new -s samed_eff"
 echo ""
 echo "  2. Chạy huấn luyện và đánh giá nối tiếp (FP32, num_workers=0, pin_memory=True):"
 echo "     cd /content/SAMed && export OMP_NUM_THREADS=2"
-echo "     python3 train_myops.py --data_root $LOCAL_DATASET --ckpt checkpoints/sam_vit_b_01ec64.pth --seed 1234 --batch_size 16 --max_epochs 300 --amp none --num_workers 0 --pin_memory --measure_efficiency --output_dir /content/drive/MyDrive/MyoPS_Results/SAMed_efficiency/runs/samed_seed1234 && \\"
-echo "     python3 evaluate_myops.py --checkpoint /content/drive/MyDrive/MyoPS_Results/SAMed_efficiency/runs/samed_seed1234/checkpoints/samed_seed1234.pt --data_root $LOCAL_DATASET --output_dir /content/drive/MyDrive/MyoPS_Results/SAMed_efficiency/runs/samed_seed1234/evaluation --amp none"
+echo "     python3 train_myops.py --data_root $LOCAL_DATASET --list_dir lists/myops380_no_val --ckpt checkpoints/sam_vit_b_01ec64.pth --run_root outputs/runs --seed 1234 --batch_size 16 --max_epochs 300 --amp none --num_workers 0 --pin_memory --measure_efficiency --efficiency_output outputs/runs/samed/efficiency_metrics.json && \\"
+echo "     python3 evaluate_myops.py --checkpoint outputs/runs/samed_seed1234/checkpoints/samed_seed1234.pt --data_root $LOCAL_DATASET --list_dir lists/myops380_no_val --output_dir outputs/runs/samed_seed1234/evaluation --amp none"
 echo ""
 echo "  3. Tách khỏi tmux (detach): Nhấn Ctrl+B rồi thả ra, sau đó nhấn D"
 echo "  4. Xem lại tiến trình: tmux attach -t samed_eff"
