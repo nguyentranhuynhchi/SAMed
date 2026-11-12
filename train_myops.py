@@ -176,6 +176,70 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
     return unique
 
 
+RESUMABLE_ARG_KEYS = (
+    "data_root",
+    "list_dir",
+    "model_id",
+    "dataset_id",
+    "vit_name",
+    "ckpt",
+    "lora_ckpt",
+    "rank",
+    "img_size",
+    "num_classes",
+    "max_epochs",
+    "batch_size",
+    "accum_steps",
+    "base_lr",
+    "weight_decay",
+    "clip_grad",
+    "dice_param",
+    "seed",
+    "num_workers",
+    "pin_memory",
+    "amp",
+    "deterministic",
+    "log_every",
+    "measure_efficiency",
+    "efficiency_output",
+)
+
+
+def _parse_args_and_explicit(argv=None) -> tuple[argparse.Namespace, set[str]]:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    explicit_parser = build_parser()
+    for action in explicit_parser._actions:
+        action.default = argparse.SUPPRESS
+    explicit_args = explicit_parser.parse_args(argv)
+    return args, set(vars(explicit_args).keys())
+
+
+def _inherit_resume_args(
+    args: argparse.Namespace,
+    explicit_dests: set[str],
+    saved_args: Any,
+    skip_keys: set[str] = frozenset(),
+) -> None:
+    if not isinstance(saved_args, dict):
+        return
+    for key in RESUMABLE_ARG_KEYS:
+        if key in skip_keys or key in explicit_dests or key not in saved_args:
+            continue
+        setattr(args, key, saved_args[key])
+
+
+def _validate_numeric_args(args: argparse.Namespace) -> None:
+    if args.max_epochs < 1:
+        raise ValueError(f"--max_epochs must be >= 1, got {args.max_epochs}")
+    if args.batch_size < 1:
+        raise ValueError(f"--batch_size must be >= 1, got {args.batch_size}")
+    if args.accum_steps < 1:
+        raise ValueError(f"--accum_steps must be >= 1, got {args.accum_steps}")
+    if args.num_workers < 0:
+        raise ValueError(f"--num_workers must be >= 0, got {args.num_workers}")
+
+
 def atomic_save(path: Path | str, payload: dict):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -185,7 +249,22 @@ def atomic_save(path: Path | str, payload: dict):
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    args, explicit_dests = _parse_args_and_explicit(argv)
+
+    resume_target: Path | None = None
+    resume_ckpt: dict[str, Any] | None = None
+    if args.resume is not None and args.resume != "auto":
+        resume_target = Path(args.resume)
+        if not resume_target.is_file():
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_target}")
+        resume_ckpt = torch.load(resume_target, map_location="cpu", weights_only=False)
+        validate_optimization_checkpoint(resume_ckpt)
+        _inherit_resume_args(args, explicit_dests, resume_ckpt.get("args"))
+        if not any(k in explicit_dests for k in ("output_dir", "run_root", "run_name")):
+            inferred_run_dir = (
+                resume_target.parent.parent if resume_target.parent.name == "checkpoints" else resume_target.parent
+            )
+            args.output_dir = str(inferred_run_dir)
 
     # Resolve paths
     if args.output_dir:
@@ -195,35 +274,90 @@ def main(argv=None):
         run_dir = base_root / (args.run_name or f"{args.model_id}_seed{args.seed}")
     else:
         run_dir = PROJECT_ROOT / "runs" / f"{args.model_id}_seed{args.seed}"
+
+    final_ckpt_path = run_dir / "checkpoints" / f"{args.model_id}_seed{args.seed}.pt"
+    auto_resume_missing = False
+    if args.resume == "auto":
+        if final_ckpt_path.is_file():
+            resume_target = final_ckpt_path
+            resume_ckpt = torch.load(resume_target, map_location="cpu", weights_only=False)
+            validate_optimization_checkpoint(resume_ckpt)
+            _inherit_resume_args(args, explicit_dests, resume_ckpt.get("args"), skip_keys={"model_id", "seed"})
+        else:
+            auto_resume_missing = True
+
+    _validate_numeric_args(args)
+
+    has_full_resume_weights = (
+        resume_ckpt is not None
+        and (resume_ckpt.get("model_state_dict") is not None or resume_ckpt.get("model") is not None)
+    )
+    if "ckpt" in explicit_dests and not has_full_resume_weights and args.ckpt and not os.path.exists(args.ckpt):
+        raise FileNotFoundError(f"Requested SAM backbone checkpoint not found: {args.ckpt}")
+
     checkpoints_dir = run_dir / "checkpoints"
     logs_dir = run_dir / "logs"
     for d in (checkpoints_dir, logs_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    final_ckpt_path = checkpoints_dir / f"{args.model_id}_seed{args.seed}.pt"
-
     # Setup logger
     log_file = logs_dir / "train.log"
+    file_handler = logging.FileHandler(str(log_file), mode="a", encoding="utf-8")
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s.%(msecs)03d] %(message)s",
         datefmt="%H:%M:%S",
         force=True,
         handlers=[
-            logging.FileHandler(str(log_file), mode="a", encoding="utf-8"),
+            file_handler,
             logging.StreamHandler(sys.stdout),
         ],
     )
 
+    try:
+        _run_training(
+            args=args,
+            explicit_dests=explicit_dests,
+            run_dir=run_dir,
+            logs_dir=logs_dir,
+            final_ckpt_path=final_ckpt_path,
+            resume_target=resume_target,
+            resume_ckpt=resume_ckpt,
+            has_full_resume_weights=has_full_resume_weights,
+            auto_resume_missing=auto_resume_missing,
+        )
+    finally:
+        root_logger = logging.getLogger()
+        if file_handler in root_logger.handlers:
+            root_logger.removeHandler(file_handler)
+        file_handler.close()
+
+
+def _run_training(
+    *,
+    args: argparse.Namespace,
+    explicit_dests: set[str],
+    run_dir: Path,
+    logs_dir: Path,
+    final_ckpt_path: Path,
+    resume_target: Path | None,
+    resume_ckpt: dict[str, Any] | None,
+    has_full_resume_weights: bool,
+    auto_resume_missing: bool,
+) -> None:
     seed_everything(args.seed, args.deterministic)
     device = resolve_device(args.device)
     amp_dtype = resolve_amp(args.amp, device)
     amp_str = "none" if amp_dtype is None else ("bf16" if amp_dtype == torch.bfloat16 else "fp16")
     pin_memory = (device.type == "cuda") if args.pin_memory is None else bool(args.pin_memory)
+    if device.type != "cuda" and "pin_memory" not in explicit_dests:
+        pin_memory = False
 
     logging.info(f"=== Starting SAMed Training on MyoPS380 (Seed {args.seed}) ===")
     logging.info(f"Run directory: {run_dir}")
     logging.info(f"Data root: {args.data_root} | List dir: {args.list_dir}")
+    if auto_resume_missing:
+        logging.info("--resume auto requested, but no checkpoint exists at %s; starting fresh.", final_ckpt_path)
 
     rule_compliant, compliance_warnings, hardware_info = check_rule_compliance(
         device=device,
@@ -249,26 +383,10 @@ def main(argv=None):
             for warn_msg in compliance_warnings:
                 logging.warning("[EFFICIENCY RULE MISMATCH] %s", warn_msg)
 
-    # Check resume checkpoint on CPU before allocating optimizer/CUDA memory
-    resume_target: Path | None = None
-    if args.resume is not None:
-        if args.resume == "auto":
-            if final_ckpt_path.is_file():
-                resume_target = final_ckpt_path
-            else:
-                logging.info("--resume auto requested, but no checkpoint exists at %s; starting fresh.", final_ckpt_path)
-        else:
-            resume_target = Path(args.resume)
-            if not resume_target.is_file():
-                raise FileNotFoundError(f"Resume checkpoint not found: {resume_target}")
-
-    resume_ckpt: dict[str, Any] | None = None
-    if resume_target is not None:
-        logging.info(f"Loading checkpoint metadata from: {resume_target}")
-        resume_ckpt = torch.load(resume_target, map_location="cpu", weights_only=False)
-        validate_optimization_checkpoint(resume_ckpt)
-        if resume_ckpt.get("training_complete", False) and not args.efficiency_only:
-            completed = resume_ckpt.get("completed_epochs", resume_ckpt.get("epoch", -1) + 1)
+    if resume_ckpt is not None:
+        logging.info(f"Loaded checkpoint metadata from: {resume_target}")
+        completed = int(resume_ckpt.get("completed_epochs", resume_ckpt.get("epoch", -1) + 1))
+        if (resume_ckpt.get("training_complete", False) or completed >= args.max_epochs) and not args.efficiency_only:
             logging.info(f"Training was already marked complete at epoch {completed}/{args.max_epochs}. Nothing to run.")
             return
 
@@ -276,10 +394,6 @@ def main(argv=None):
     # In SAMed, num_multimask_outputs = args.num_classes - 1 (e.g. 4 - 1 = 3),
     # producing exactly num_mask_tokens = 3 + 1 = 4 output channels.
     num_multimask = args.num_classes - 1 if args.num_classes > 1 else 1
-    has_full_resume_weights = (
-        resume_ckpt is not None
-        and (resume_ckpt.get("model_state_dict") is not None or resume_ckpt.get("model") is not None)
-    )
     sam_checkpoint = args.ckpt if (not has_full_resume_weights and args.ckpt and os.path.exists(args.ckpt)) else None
     if sam_checkpoint:
         logging.info(f"Loading pretrained SAM backbone from: {sam_checkpoint}")
@@ -486,6 +600,13 @@ def main(argv=None):
         global_step = int(resume_ckpt.get("global_step", resume_ckpt.get("successful", start_epoch * updates_per_epoch)))
         amp_skipped_updates = int(resume_ckpt.get("amp_skipped_updates", 0))
         epoch_times = [float(t) for t in resume_ckpt.get("epoch_times", [])][: max(0, start_epoch)]
+        if start_epoch > 0 and len(epoch_times) < start_epoch and args.measure_efficiency:
+            logging.warning(
+                "Resumed checkpoint at epoch %d only has %d recorded epoch_times; "
+                "efficiency timing totals will reflect only available epochs.",
+                start_epoch,
+                len(epoch_times),
+            )
         prev_wall_clock_s = float(resume_ckpt.get("total_wall_clock_seconds", 0.0))
         max_train_peak_vram_bytes = int(resume_ckpt.get("train_peak_vram_bytes", 0))
         max_train_reserved_bytes = int(resume_ckpt.get("train_peak_reserved_bytes", 0))
@@ -501,10 +622,13 @@ def main(argv=None):
         if "torch_cuda" in rng and torch.cuda.is_available() and rng["torch_cuda"] is not None:
             try:
                 cuda_states = [s.cpu() for s in rng["torch_cuda"]] if isinstance(rng["torch_cuda"], list) else rng["torch_cuda"].cpu()
-                if isinstance(cuda_states, list) and len(cuda_states) == torch.cuda.device_count():
-                    torch.cuda.set_rng_state_all(cuda_states)
-                elif isinstance(cuda_states, list) and len(cuda_states) > 0:
-                    torch.cuda.set_rng_state(cuda_states[0])
+                if isinstance(cuda_states, list):
+                    if len(cuda_states) == torch.cuda.device_count():
+                        torch.cuda.set_rng_state_all(cuda_states)
+                    elif len(cuda_states) > 0:
+                        torch.cuda.set_rng_state(cuda_states[0])
+                else:
+                    torch.cuda.set_rng_state(cuda_states)
             except Exception as e:
                 logging.warning(f"Could not restore CUDA RNG state: {e}")
 

@@ -28,6 +28,7 @@ from utils.efficiency import (
     format_efficiency_report,
     measure_flops,
     measure_inference_efficiency,
+    save_efficiency_report,
     summarize_training_efficiency,
 )
 
@@ -44,6 +45,7 @@ class SAMedEfficiencyTests(unittest.TestCase):
         self.assertEqual(emb_size, 8)
         net = LoRA_Sam(sam, r=4).float()
         net.train()
+        orig_requires_grad = [p.requires_grad for p in net.parameters()]
 
         params_info = count_parameters(net)
         self.assertEqual(params_info["total_params"], 90_729_008)
@@ -63,8 +65,9 @@ class SAMedEfficiencyTests(unittest.TestCase):
         self.assertLess(flops_wrapped["flops_total"], 18_000_000_000)
         self.assertAlmostEqual(flops_wrapped["flops_g_excel"], 17.23, places=2)
 
-        # Ensure requires_grad and training mode are completely restored after measure_flops
+        # Ensure exact per-parameter requires_grad flags and training mode are restored after measure_flops
         self.assertTrue(net.training)
+        self.assertEqual([p.requires_grad for p in net.parameters()], orig_requires_grad)
         restored_params = count_parameters(net)
         self.assertEqual(restored_params["trainable_params"], 4_212_016)
 
@@ -190,6 +193,40 @@ class SAMedEfficiencyTests(unittest.TestCase):
         self.assertIn("4.21M", txt)
         self.assertIn("17.23 G", txt)
 
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            out_json = tmp_path / "eff.v1.json"
+            out_txt = tmp_path / "summary.v1.txt"
+            save_efficiency_report(payload, [out_json], [out_txt])
+            self.assertTrue(out_json.is_file())
+            self.assertTrue(out_txt.is_file())
+            self.assertFalse((tmp_path / "eff.v1.json.tmp").exists())
+            self.assertFalse((tmp_path / "summary.v1.txt.tmp").exists())
+            self.assertEqual(json.loads(out_json.read_text(encoding="utf-8"))["seed"], 1234)
+
+    def test_fast_fail_invalid_args_and_explicit_missing_ckpt(self) -> None:
+        import train_myops
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            with self.assertRaises(ValueError):
+                train_myops.main([
+                    "--output_dir", str(tmp_path / "bad_epochs"),
+                    "--max_epochs", "0",
+                    "--device", "cpu",
+                    "--amp", "none",
+                ])
+
+            with self.assertRaises(FileNotFoundError):
+                train_myops.main([
+                    "--output_dir", str(tmp_path / "missing_ckpt"),
+                    "--ckpt", str(tmp_path / "nonexistent_sam.pth"),
+                    "--efficiency_only",
+                    "--device", "cpu",
+                    "--amp", "none",
+                ])
+            self.assertFalse((tmp_path / "missing_ckpt").exists())
+
     def test_cli_flag_aliases(self) -> None:
         import train_myops
 
@@ -293,7 +330,7 @@ class SAMedEfficiencyTests(unittest.TestCase):
             self.assertFalse(no_eff_out.exists())
             self.assertTrue((no_eff_dir / "checkpoints" / "samed_seed1234.pt").is_file())
 
-            # 3) Full 2-epoch training with efficiency measurement
+            # 3) Full 2-epoch training with efficiency measurement (non-default seed 1098)
             run_dir = tmp_path / "run_train"
             eff_train_out = tmp_path / "eff_train" / "efficiency_metrics.json"
             base_cmd = [
@@ -302,6 +339,7 @@ class SAMedEfficiencyTests(unittest.TestCase):
                 "--data_root", str(data_root),
                 "--list_dir", str(list_dir),
                 "--output_dir", str(run_dir),
+                "--seed", "1098",
                 "--batch_size", "2",
                 "--max_epochs", "2",
                 "--amp", "none",
@@ -312,16 +350,17 @@ class SAMedEfficiencyTests(unittest.TestCase):
             ]
             r1 = subprocess.run(base_cmd, capture_output=True, text=True)
             self.assertEqual(r1.returncode, 0, msg=r1.stderr)
-            ckpt_file = run_dir / "checkpoints" / "samed_seed1234.pt"
+            ckpt_file = run_dir / "checkpoints" / "samed_seed1098.pt"
             self.assertTrue(ckpt_file.is_file())
             self.assertTrue(eff_train_out.is_file())
             self.assertTrue((run_dir / "efficiency_metrics.json").is_file())
             self.assertTrue((run_dir / "logs" / "efficiency_summary.txt").is_file())
             train_payload = json.loads(eff_train_out.read_text(encoding="utf-8"))
+            self.assertEqual(train_payload["seed"], 1098)
             self.assertEqual(train_payload["training"]["completed_epochs"], 2)
             self.assertEqual(len(train_payload["training"]["all_epoch_times_s"]), 2)
 
-            # 4) Simulate interruption at epoch 0 (1 completed epoch) and verify --resume preserves epoch_times
+            # 4) Simulate interruption at epoch 0 and verify bare --resume <ckpt> inherits all saved args & run_dir
             ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
             self.assertEqual(ckpt["completed_epochs"], 2)
             self.assertTrue(ckpt["training_complete"])
@@ -337,10 +376,17 @@ class SAMedEfficiencyTests(unittest.TestCase):
             torch.save(ckpt, ckpt_file)
             eff_train_out.unlink()
 
-            r2 = subprocess.run(base_cmd + ["--resume", str(ckpt_file)], capture_output=True, text=True)
+            r2 = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "train_myops.py"), "--resume", str(ckpt_file), "--device", "cpu"],
+                capture_output=True,
+                text=True,
+            )
             self.assertEqual(r2.returncode, 0, msg=r2.stderr)
             self.assertTrue(eff_train_out.is_file())
             resumed_payload = json.loads(eff_train_out.read_text(encoding="utf-8"))
+            self.assertEqual(resumed_payload["seed"], 1098)
+            self.assertEqual(resumed_payload["environment"]["amp_mode"], "none")
+            self.assertEqual(resumed_payload["environment"]["num_workers"], 0)
             self.assertEqual(resumed_payload["training"]["completed_epochs"], 2)
             self.assertEqual(len(resumed_payload["training"]["all_epoch_times_s"]), 2)
             self.assertAlmostEqual(
@@ -349,10 +395,22 @@ class SAMedEfficiencyTests(unittest.TestCase):
                 places=4,
             )
 
-            # 5) Resuming an already-complete checkpoint exits cleanly without overwriting JSON
+            # 5) Resuming an already-complete checkpoint (even if training_complete=False at completed==max_epochs)
+            # exits cleanly without overwriting JSON
             eff_train_out.unlink()
             r3 = subprocess.run(base_cmd + ["--resume", str(ckpt_file)], capture_output=True, text=True)
             self.assertEqual(r3.returncode, 0, msg=r3.stderr)
+            self.assertFalse(eff_train_out.exists())
+
+            ckpt_done = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+            ckpt_done["training_complete"] = False
+            torch.save(ckpt_done, ckpt_file)
+            r3b = subprocess.run(
+                [sys.executable, str(REPO_ROOT / "train_myops.py"), "--resume", str(ckpt_file), "--device", "cpu"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(r3b.returncode, 0, msg=r3b.stderr)
             self.assertFalse(eff_train_out.exists())
 
             # 6) Verify evaluate_myops.py runs cleanly on the produced checkpoint

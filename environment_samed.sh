@@ -107,9 +107,10 @@ for DRIVE_CANDIDATE in \
     "/content/drive/MyDrive/Processed_data" \
     "/content/drive/MyDrive/NCKH_V2/MyoPS380_dataset/Processed_data" \
     "/content/drive/MyDrive/NCKH/MyoPS380_dataset/Processed_data"; do
-    if [ -d "$DRIVE_CANDIDATE" ] && [ ! -d "$TARGET_DATASET_DIR/Processed_data" ]; then
+    if [ -d "$DRIVE_CANDIDATE" ] && [ -z "$(ls -A "$TARGET_DATASET_DIR/Processed_data" 2>/dev/null)" ]; then
         echo "✅ Phát hiện dataset trên Google Drive: $DRIVE_CANDIDATE. Đang sao chép vào SSD cục bộ..."
-        cp -r "$DRIVE_CANDIDATE" "$TARGET_DATASET_DIR/"
+        mkdir -p "$TARGET_DATASET_DIR/Processed_data"
+        cp -r "$DRIVE_CANDIDATE/." "$TARGET_DATASET_DIR/Processed_data/"
         break
     fi
 done
@@ -121,14 +122,17 @@ if [ -z "$(ls -A "$DOWNLOAD_DIR" 2>/dev/null)" ] && [ -z "$(ls -A "$TARGET_DATAS
     }
 fi
 
-for zipfile in $(find "$DOWNLOAD_DIR" -maxdepth 2 -name "*.zip" 2>/dev/null); do
-    echo "Đang giải nén $zipfile vào $TARGET_DATASET_DIR ..."
-    command -v unzip &>/dev/null || (apt-get update -qq && apt-get install -y unzip)
-    unzip -q -o "$zipfile" -d "$TARGET_DATASET_DIR/"
-done
+if [ ! -d "$TARGET_DATASET_DIR/Processed_data/bSSFP" ]; then
+    for zipfile in $(find "$DOWNLOAD_DIR" -maxdepth 2 -name "*.zip" 2>/dev/null); do
+        echo "Đang giải nén $zipfile vào $TARGET_DATASET_DIR ..."
+        command -v unzip &>/dev/null || (apt-get update -qq && apt-get install -y unzip)
+        unzip -q -o "$zipfile" -d "$TARGET_DATASET_DIR/"
+    done
 
-if [ -d "$DOWNLOAD_DIR/Processed_data" ] && [ ! -d "$TARGET_DATASET_DIR/Processed_data" ]; then
-    cp -r "$DOWNLOAD_DIR/Processed_data" "$TARGET_DATASET_DIR/"
+    if [ -d "$DOWNLOAD_DIR/Processed_data" ] && [ -z "$(ls -A "$TARGET_DATASET_DIR/Processed_data" 2>/dev/null)" ]; then
+        mkdir -p "$TARGET_DATASET_DIR/Processed_data"
+        cp -r "$DOWNLOAD_DIR/Processed_data/." "$TARGET_DATASET_DIR/Processed_data/"
+    fi
 fi
 
 FOUND_BSSFP=$(find "$TARGET_DATASET_DIR" "$DOWNLOAD_DIR" -type d -name "bSSFP" 2>/dev/null | head -n 1)
@@ -151,15 +155,15 @@ python3 -c "import torch; print(f'PyTorch: {torch.__version__} | CUDA: {torch.cu
 
 echo "=== HOÀN TẤT THIẾT LẬP MÔI TRƯỜNG CHO SAMED ==="
 echo ""
-echo "💡 HƯỚNG DẪN CHẠY HUẤN LUYỆN VÀ ĐÁNH GIÁ (5 SEED CHUẨN):"
+echo "💡 HƯỚNG DẪN CHẠY ĐO HIỆU SUẤT TÍNH TOÁN (1 SEED ĐỘC LẬP 1234, KHÔNG GHI ĐÈ 5 SEED CŨ):"
 echo "  1. Mở session tmux mới:"
-echo "     tmux new -s train_samed"
+echo "     tmux new -s samed_eff"
 echo ""
-echo "  2. Chạy huấn luyện và đánh giá nối tiếp (ví dụ Seed 1234):"
-echo "     cd /content/SAMed"
-echo "     python3 train_myops.py --data_root $LOCAL_DATASET --seed 1234 --output_dir /content/drive/MyDrive/MyoPS_Results/SAMed/runs/samed_seed1234 && \\"
-echo "     python3 evaluate_myops.py --checkpoint /content/drive/MyDrive/MyoPS_Results/SAMed/runs/samed_seed1234/checkpoints/samed_seed1234.pt --data_root $LOCAL_DATASET"
+echo "  2. Chạy huấn luyện và đánh giá nối tiếp (FP32, num_workers=0, pin_memory=True):"
+echo "     cd /content/SAMed && export OMP_NUM_THREADS=2"
+echo "     python3 train_myops.py --data_root $LOCAL_DATASET --ckpt checkpoints/sam_vit_b_01ec64.pth --seed 1234 --batch_size 16 --max_epochs 300 --amp none --num_workers 0 --pin_memory --measure_efficiency --output_dir /content/drive/MyDrive/MyoPS_Results/SAMed_efficiency/runs/samed_seed1234 && \\"
+echo "     python3 evaluate_myops.py --checkpoint /content/drive/MyDrive/MyoPS_Results/SAMed_efficiency/runs/samed_seed1234/checkpoints/samed_seed1234.pt --data_root $LOCAL_DATASET --output_dir /content/drive/MyDrive/MyoPS_Results/SAMed_efficiency/runs/samed_seed1234/evaluation --amp none"
 echo ""
 echo "  3. Tách khỏi tmux (detach): Nhấn Ctrl+B rồi thả ra, sau đó nhấn D"
-echo "  4. Xem lại tiến trình: tmux attach -t train_samed"
+echo "  4. Xem lại tiến trình: tmux attach -t samed_eff"
 echo ""

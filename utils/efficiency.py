@@ -104,7 +104,8 @@ def measure_flops(
         dummy_input = torch.randn(*input_shape, dtype=torch.float32, device=device)
         flop_counter = FlopCounterMode(display=False)
         with torch.no_grad(), flop_counter:
-            _ = target_model(dummy_input)
+            out = target_model(dummy_input)
+            del out
         sync_if_cuda(device)
         total_flops = int(flop_counter.get_total_flops())
     finally:
@@ -145,12 +146,14 @@ def measure_inference_efficiency(
 
         with torch.no_grad():
             for _ in range(warmup):
-                _ = target_model(dummy_input)
+                out = target_model(dummy_input)
+                del out
             sync_if_cuda(device)
 
             t_start = time.perf_counter()
             for _ in range(repeats):
-                _ = target_model(dummy_input)
+                out = target_model(dummy_input)
+                del out
             sync_if_cuda(device)
             t_end = time.perf_counter()
 
@@ -440,7 +443,7 @@ def save_efficiency_report(
     report_str = format_efficiency_report(payload)
     for out_path in output_paths:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = out_path.with_suffix(".tmp")
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         tmp_path.replace(out_path)
@@ -449,7 +452,9 @@ def save_efficiency_report(
 
     for txt_path in summary_text_paths:
         txt_path.parent.mkdir(parents=True, exist_ok=True)
-        txt_path.write_text(report_str + "\n", encoding="utf-8")
+        tmp_txt = txt_path.with_suffix(txt_path.suffix + ".tmp")
+        tmp_txt.write_text(report_str + "\n", encoding="utf-8")
+        tmp_txt.replace(txt_path)
 
     if log is not None:
         for line in report_str.splitlines():
