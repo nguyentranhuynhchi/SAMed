@@ -7,7 +7,7 @@
 
 set -e
 
-echo "=== [1/6] Kiểm tra và Kích hoạt GPU NVIDIA ==="
+echo "=== [1/7] Kiểm tra và Kích hoạt GPU NVIDIA ==="
 cd /content
 
 if [ -d "/usr/lib64-nvidia" ]; then
@@ -27,7 +27,7 @@ else
     nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 fi
 
-echo "=== [2/6] Mount Google Drive (Lưu Checkpoint an toàn) ==="
+echo "=== [2/7] Mount Google Drive (Lưu Checkpoint an toàn) ==="
 python3 -c "
 import os
 if not os.path.exists('/content/drive/MyDrive'):
@@ -39,19 +39,21 @@ if not os.path.exists('/content/drive/MyDrive'):
         print('⚠️ Không thể mount Drive tự động (bỏ qua nếu không dùng):', e)
 " || true
 
-echo "=== [3/6] Điều hướng thư mục SAMed ==="
+echo "=== [3/7] Điều hướng thư mục SAMed ==="
 if [ ! -d "/content/SAMed" ]; then
     echo "Thư mục /content/SAMed chưa tồn tại. Clone repo..."
     git clone https://github.com/nguyentranhuynhchi/SAMed.git /content/SAMed
 else
-    echo "Thư mục /content/SAMed đã tồn tại. Tiến hành cập nhật nhánh main..."
     cd /content/SAMed
-    git checkout main 2>/dev/null || true
-    git pull origin main || true
+    CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main")
+    echo "Thư mục /content/SAMed đã tồn tại (nhánh hiện tại: $CURRENT_BRANCH). Tiến hành cập nhật..."
+    if [ "$CURRENT_BRANCH" != "HEAD" ]; then
+        git pull origin "$CURRENT_BRANCH" || true
+    fi
 fi
 cd /content/SAMed
 
-echo "=== [4/6] Cài đặt Dependencies cho SAMed ==="
+echo "=== [4/7] Cài đặt Dependencies cho SAMed ==="
 python3 -m pip install --upgrade pip -q
 python3 -m pip install -r requirements.txt gdown -q
 
@@ -112,7 +114,7 @@ for DRIVE_CANDIDATE in \
     fi
 done
 
-if [ -z "$(ls -A "$DOWNLOAD_DIR" 2>/dev/null)" ] && [ -z "$(ls -A "$TARGET_DATASET_DIR" 2>/dev/null)" ]; then
+if [ -z "$(ls -A "$DOWNLOAD_DIR" 2>/dev/null)" ] && [ -z "$(ls -A "$TARGET_DATASET_DIR/Processed_data" 2>/dev/null)" ]; then
     echo "Đang tải toàn bộ thư mục dataset từ Google Drive (Folder ID: $DATASET_FOLDER_ID)..."
     gdown --folder --id "$DATASET_FOLDER_ID" -O "$DOWNLOAD_DIR" --remaining-ok || {
         echo "⚠️ Tải folder qua gdown gặp cảnh báo, tiếp tục kiểm tra các tệp đã tải..."

@@ -129,6 +129,7 @@ dmypy.json
 .pyre/
 
 # Training artifacts & checkpoints
+outputs/
 checkpoints/
 runs/
 *.npz

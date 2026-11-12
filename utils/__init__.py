@@ -16,6 +16,7 @@ from .metrics import (
     summarize_dataset_rows,
     calculate_metric_percase,
 )
+from . import efficiency
 
 __all__ = [
     "DiceLoss",
@@ -33,4 +34,5 @@ __all__ = [
     "summarize_rows",
     "summarize_dataset_rows",
     "calculate_metric_percase",
+    "efficiency",
 ]

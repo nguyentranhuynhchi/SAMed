@@ -76,7 +76,11 @@ def resolve_amp(mode: str, device: torch.device):
         return None
     if device.type != "cuda":
         raise ValueError("Mixed precision requires CUDA; use --amp none on CPU.")
-    if mode == "bf16" or (mode == "auto" and torch.cuda.is_bf16_supported()):
+    if mode == "bf16":
+        if not torch.cuda.is_bf16_supported():
+            raise ValueError("bfloat16 is not supported on this CUDA device.")
+        return torch.bfloat16
+    if mode == "auto" and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     return torch.float16
 
@@ -189,7 +193,7 @@ def main(argv=None):
         # Fallback for lora-only saved dict
         net.load_lora_parameters(str(checkpoint_path))
 
-    net.to(device).eval()
+    net.float().to(device).eval()
 
     # Load dataset
     dataset = MyopsDataset(
