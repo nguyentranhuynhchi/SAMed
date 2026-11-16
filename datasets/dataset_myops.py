@@ -1,11 +1,17 @@
-"""Aligned CINE/LGE/T2w dataset for SAMed on MyoPS380 with Canonical Target Adapter.
+"""Aligned CINE/LGE/T2w dataset for SAMed supporting MyoPS380 and MyoPS++ benchmarks.
+
+Protocols:
+  - MyoPS380: myops380_train304_test76_last_v1 (304 train patients / 1,972 slices, 76 test volumes)
+  - MyoPS++:  myopspp_bc80_train64_test16_last_v1 (64 train patients / 296 slices, 16 test volumes)
 
 Input: Early-fusion 3-channel CMR [bSSFP, LGE, T2w] shape (B, 3, 128, 128).
-Target Adapter: In-memory LUT [0, 1, 3, 2] converting Legacy to Canonical:
-  0: Background
-  1: Normal Myocardium
-  2: Edema (exclusive)
-  3: Scar
+Double-Swap Prevention:
+  - MyoPS380: Target Adapter applies in-memory LUT [0, 1, 3, 2] converting Legacy to Canonical:
+      0: Background, 1: Normal Myocardium, 2: Edema (exclusive), 3: Scar
+  - MyoPS++: Disk cache is ALREADY Canonical -> Identity mapping (NO LUT swap).
+Distance Metrics:
+  - MyoPS380: Voxel distance (spacing=None, metric_distance_unit='voxel')
+  - MyoPS++: Physical mm with dynamic spacing [1.0, 1.0, s_z] (metric_distance_unit='mm')
 Augmentation: 100% exact RandomGenerator from SCAR / I-MMSeg standard.
 """
 from __future__ import annotations
@@ -14,6 +20,7 @@ import os
 from pathlib import Path
 import random
 import re
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import h5py
 import numpy as np
@@ -21,18 +28,73 @@ from scipy import ndimage
 from scipy.ndimage import zoom
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 
 CLASS_NAMES = ("background", "normal_myocardium", "edema", "scar")
 CANONICAL_LABEL_ORDER = "background_normal_edema_scar"
 LEGACY_LABEL_ORDER = "background_normal_scar_edema"
+IDENTITY_LABEL_ORDER = "canonical"
+
 LABEL_ORDERS = {
     "canonical": CANONICAL_LABEL_ORDER,
     "legacy": LEGACY_LABEL_ORDER,
+    "identity": CANONICAL_LABEL_ORDER,
+    "identity_mapping": CANONICAL_LABEL_ORDER,
     CANONICAL_LABEL_ORDER: CANONICAL_LABEL_ORDER,
     LEGACY_LABEL_ORDER: LEGACY_LABEL_ORDER,
 }
+
+# Dataset Constants
+MYOPS380_EXPECTED_TRAIN_SLICES = 1972
+MYOPS380_EXPECTED_TRAIN_PATIENTS = 304
+MYOPS380_EXPECTED_TEST_VOLUMES = 76
+
+MYOPSPP_EXPECTED_TRAIN_SLICES = 296
+MYOPSPP_EXPECTED_TRAIN_PATIENTS = 64
+MYOPSPP_EXPECTED_TEST_VOLUMES = 16
+
+# Backward compatibility aliases
+EXPECTED_TRAIN_SLICES = MYOPS380_EXPECTED_TRAIN_SLICES
+EXPECTED_TRAIN_PATIENTS = MYOPS380_EXPECTED_TRAIN_PATIENTS
+EXPECTED_TEST_VOLUMES = MYOPS380_EXPECTED_TEST_VOLUMES
+
+CANONICAL_LUT = np.array([0, 1, 3, 2], dtype=np.uint8)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def normalize_dataset_name(dataset: Optional[str]) -> str:
+    """Normalize dataset identifier string to canonical 'myops380' or 'myopspp'."""
+    if dataset is None:
+        return "myops380"
+    ds = str(dataset).strip().lower()
+    if not ds:
+        return "myops380"
+    if ds in ("myopspp", "myopspp_unet2d_roi128_1mm", "myops_plus_plus", "myops++"):
+        return "myopspp"
+    if ds in ("myops380", "myops_380", "default"):
+        return "myops380"
+    raise ValueError(f"Unknown dataset identifier: {dataset!r}; expected 'myops380' or 'myopspp'")
+
+
+def resolve_default_list_dir(dataset: str) -> Path:
+    """Resolves default split list directory based on dataset."""
+    norm_ds = normalize_dataset_name(dataset)
+    if norm_ds == "myopspp":
+        candidates = [
+            PROJECT_ROOT / "lists" / "lists_MyoPSpp",
+            PROJECT_ROOT / "lists" / "myopspp_no_val",
+        ]
+    else:
+        candidates = [
+            PROJECT_ROOT / "lists" / "myops380_no_val",
+            PROJECT_ROOT / "lists" / "lists_MyoPS380",
+        ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return candidates[0]
 
 
 def resolve_label_order(value):
@@ -41,15 +103,16 @@ def resolve_label_order(value):
     if isinstance(value, bytes):
         value = value.decode("utf-8")
     try:
-        return LABEL_ORDERS[str(value)]
+        return LABEL_ORDERS[str(value).strip().lower()]
     except KeyError as exc:
-        raise ValueError(f"Unknown label order {value!r}; use canonical or legacy.") from exc
+        raise ValueError(f"Unknown label order {value!r}; use 'canonical', 'legacy', or 'identity'.") from exc
 
 
 def canonicalize_label(label, label_order="legacy"):
     """Convert 0..3 class IDs in memory once, never mutate the source array.
-    
-    Legacy (0: bg, 1: myo, 2: scar, 3: edema) -> Canonical (0: bg, 1: myo, 2: edema, 3: scar).
+
+    - Legacy (0: bg, 1: myo, 2: scar, 3: edema) -> Canonical (0: bg, 1: myo, 2: edema, 3: scar).
+    - Canonical / Identity: Preserved directly (avoids double-swap bug on MyoPS++).
     """
     label = np.asarray(label)
     if not np.isfinite(label).all() or not np.equal(label, np.round(label)).all():
@@ -64,7 +127,7 @@ def canonicalize_label(label, label_order="legacy"):
 
 
 def patient_id(sample_name):
-    """Extract patient ID from caseXXXX_sliceNNN or caseXXXX."""
+    """Extract patient ID from caseXXXX_sliceNNN or caseXXXX / CaseXXXX (preserving casing)."""
     name = str(sample_name).strip()
     for extension in (".npy.h5", ".nii.gz", ".npz", ".h5", ".nii"):
         if name.endswith(extension):
@@ -75,13 +138,34 @@ def patient_id(sample_name):
     return re.sub(r"_slice\d+$", "", name)
 
 
+def extract_patient_id(sample_name):
+    """Alias for patient_id."""
+    return patient_id(sample_name)
+
+
 def read_split_names(list_dir, split):
-    path = Path(list_dir) / f"{split}.txt"
-    if not path.is_file():
-        raise FileNotFoundError(f"Missing split manifest: {path}")
-    names = [line.strip() for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+    path = Path(list_dir)
+    if path.is_file():
+        actual_path = path
+    else:
+        candidates = [
+            path / f"{split}.txt",
+            path / f"{split}",
+        ]
+        if split in ("test", "test_vol", "volume"):
+            candidates.extend([path / "test_vol.txt", path / "test.txt"])
+        elif split in ("train", "train_slices"):
+            candidates.extend([path / "train.txt", path / "train_slices.txt"])
+        actual_path = None
+        for c in candidates:
+            if c.is_file():
+                actual_path = c
+                break
+        if actual_path is None:
+            raise FileNotFoundError(f"Missing split manifest: {path / f'{split}.txt'}")
+    names = [line.strip() for line in actual_path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
     if len(names) != len(set(names)):
-        raise ValueError(f"Duplicate samples in {path}; regenerate manifests without append mode.")
+        raise ValueError(f"Duplicate samples in {actual_path}; regenerate manifests without append mode.")
     return names
 
 
@@ -216,7 +300,7 @@ class RandomGenerator:
 # ---------------------------------------------------------------------------
 
 class MyopsDataset(Dataset):
-    """MyoPS380 dataset providing 3-channel early fusion tensor and canonical targets."""
+    """MyoPS380 & MyoPS++ dataset providing 3-channel early fusion tensor and canonical targets."""
 
     def __init__(
         self,
@@ -226,10 +310,14 @@ class MyopsDataset(Dataset):
         list_dir=None,
         split="train",
         transform=None,
-        label_order="legacy",
+        label_order=None,
         low_res=(32, 32),
         validate_files=False,
+        dataset="myops380",
+        strict=False,
     ):
+        self.dataset = normalize_dataset_name(dataset)
+
         # Support multiple calling conventions:
         # 1. SCAR style: MyopsDataset(bssfp_dir, lge_dir, t2w_dir, list_dir, split)
         # 2. Single root positional: MyopsDataset(data_root, list_dir, split)
@@ -252,29 +340,80 @@ class MyopsDataset(Dataset):
                 root / "T2w" / subfolder,
             )
 
+        if actual_list_dir is None:
+            actual_list_dir = resolve_default_list_dir(self.dataset)
+
         self.split = actual_split
         self.list_dir = actual_list_dir
         self.transform = transform
-        self.label_order = label_order
+
+        # Label order determination:
+        # MyoPS++ is ALREADY canonical on disk -> default to "canonical" (Identity mapping).
+        # MyoPS380 is legacy on disk -> default to "legacy" (LUT [0, 1, 3, 2] conversion).
+        if label_order is None:
+            self.label_order = "canonical" if self.dataset == "myopspp" else "legacy"
+        else:
+            self.label_order = label_order
+
         self.low_res = tuple(low_res) if low_res is not None else (32, 32)
         self.sample_list = read_split_names(self.list_dir, self.split)
         self.is_volume = self.split.endswith("vol") or self.split in {"test", "volume"}
         self.extension = ".npy.h5" if self.is_volume else ".npz"
 
+        if strict:
+            exp_slices = MYOPSPP_EXPECTED_TRAIN_SLICES if self.dataset == "myopspp" else MYOPS380_EXPECTED_TRAIN_SLICES
+            exp_patients = MYOPSPP_EXPECTED_TRAIN_PATIENTS if self.dataset == "myopspp" else MYOPS380_EXPECTED_TRAIN_PATIENTS
+            exp_vols = MYOPSPP_EXPECTED_TEST_VOLUMES if self.dataset == "myopspp" else MYOPS380_EXPECTED_TEST_VOLUMES
+
+            if self.is_volume:
+                if len(self.sample_list) != exp_vols:
+                    raise ValueError(
+                        f"Expected exactly {exp_vols} test volumes for {self.dataset}, got {len(self.sample_list)}"
+                    )
+            else:
+                if len(self.sample_list) != exp_slices:
+                    raise ValueError(
+                        f"Expected exactly {exp_slices} train slices for {self.dataset}, got {len(self.sample_list)}"
+                    )
+                p_set = {patient_id(s) for s in self.sample_list}
+                if len(p_set) != exp_patients:
+                    raise ValueError(
+                        f"Expected exactly {exp_patients} train patients for {self.dataset}, got {len(p_set)}"
+                    )
+
         if validate_files:
-            required = [root / f"{name}{self.extension}" for name in self.sample_list for root in self.roots]
-            missing = [str(path) for path in required if not path.is_file()]
+            missing = []
+            for name in self.sample_list:
+                for root in self.roots:
+                    p = self._resolve_sample_path(root, name)
+                    if not p.is_file():
+                        missing.append(str(p))
             if missing:
                 raise FileNotFoundError(f"Missing {len(missing)} aligned modality file(s); first: {missing[:5]}")
 
     def __len__(self):
         return len(self.sample_list)
 
+    def _resolve_sample_path(self, root: Path, name: str) -> Path:
+        """Find sample file handling .npy.h5, .h5, and .npz extensions."""
+        primary = root / f"{name}{self.extension}"
+        if primary.is_file():
+            return primary
+        for ext in (".npy.h5", ".h5", ".npz"):
+            candidate = root / f"{name}{ext}"
+            if candidate.is_file():
+                return candidate
+        return primary
+
     def _read(self, path):
-        if path.name.endswith(".h5"):
+        if str(path).endswith(".h5"):
             with h5py.File(path, "r") as data:
                 image = data["image"][:]
-                label = data["label"][:] if "label" in data else None
+                label = None
+                for k in ("label", "gt", "segmentation"):
+                    if k in data:
+                        label = data[k][:]
+                        break
                 metadata = dict(data.attrs)
                 for key in ("spacing", "affine"):
                     if key in data:
@@ -294,15 +433,23 @@ class MyopsDataset(Dataset):
 
     def __getitem__(self, idx):
         name = self.sample_list[idx]
-        modalities = [self._read(root / f"{name}{self.extension}") for root in self.roots]
+        modalities = [self._read(self._resolve_sample_path(root, name)) for root in self.roots]
         image, label, metadata = modalities[0]
         image1 = modalities[1][0]
         image2 = modalities[2][0]
 
         if self.is_volume:
-            spacing = np.asarray(metadata.get("spacing", [np.nan] * 3), dtype=np.float64)
+            spacing = metadata.get("spacing")
+            if spacing is not None:
+                spacing = np.asarray(spacing, dtype=np.float64)
+            elif self.dataset == "myopspp":
+                # Default isotropic in-plane ROI spacing for MyoPS++
+                spacing = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+            else:
+                spacing = np.asarray([np.nan, np.nan, np.nan], dtype=np.float64)
+
             affine = np.asarray(metadata.get("affine", np.full((4, 4), np.nan)), dtype=np.float64)
-            raw_unit = metadata.get("spacing_unit", "unknown")
+            raw_unit = metadata.get("spacing_unit", "mm" if self.dataset == "myopspp" else "voxel")
             if isinstance(raw_unit, np.ndarray):
                 raw_unit = raw_unit.item()
             if isinstance(raw_unit, bytes):
@@ -331,6 +478,7 @@ class MyopsDataset(Dataset):
                 "spacing_unit": spacing_unit,
                 "has_geometry": has_geom,
                 "has_affine": valid_geom,
+                "dataset": self.dataset,
             }
 
         sample = {
@@ -339,6 +487,7 @@ class MyopsDataset(Dataset):
             "image2": image2,
             "label": label.astype(np.int64),
             "case_name": name,
+            "dataset": self.dataset,
         }
 
         if self.transform is not None:
@@ -369,4 +518,78 @@ class MyopsDataset(Dataset):
             "label": label_tensor,
             "low_res_label": low_res_label,
             "case_name": name,
+            "dataset": self.dataset,
         }
+
+
+# Aliases for dataset classes
+MyoPSTrainDataset = MyopsDataset
+MyoPSTestDataset = MyopsDataset
+MyoPS380TrainDataset = MyopsDataset
+MyoPS380TestDataset = MyopsDataset
+
+
+def seed_worker(worker_id: int):
+    """Seed dataloader worker deterministically."""
+    worker_seed = (torch.initial_seed() + worker_id) % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def create_myops_train_loader(
+    base_dir: Union[str, Path],
+    list_dir: Optional[Union[str, Path]] = None,
+    dataset: str = "myops380",
+    batch_size: int = 16,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    transform: Optional[Callable] = None,
+    strict: bool = False,
+    generator: Optional[torch.Generator] = None,
+    low_res: Tuple[int, int] = (32, 32),
+) -> DataLoader:
+    """Factory helper to construct standardized train DataLoader for MyoPS380 or MyoPS++."""
+    ds = MyopsDataset(
+        base_dir=base_dir,
+        list_dir=list_dir,
+        split="train",
+        dataset=dataset,
+        transform=transform,
+        strict=strict,
+        low_res=low_res,
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+        generator=generator,
+        worker_init_fn=seed_worker,
+    )
+
+
+def create_myops_test_loader(
+    base_dir: Union[str, Path],
+    list_dir: Optional[Union[str, Path]] = None,
+    dataset: str = "myops380",
+    split: str = "test_vol",
+    num_workers: int = 0,
+    strict: bool = False,
+) -> DataLoader:
+    """Factory helper to construct standardized test DataLoader for MyoPS380 or MyoPS++."""
+    ds = MyopsDataset(
+        base_dir=base_dir,
+        list_dir=list_dir,
+        split=split,
+        dataset=dataset,
+        strict=strict,
+    )
+    return DataLoader(
+        ds,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+    )

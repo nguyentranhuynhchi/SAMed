@@ -1,6 +1,8 @@
-"""Evaluation script for SAMed on MyoPS380 held-out test volumes (76 cases).
+"""Evaluation script for SAMed on MyoPS380 (76 cases) and MyoPS++ (16 cases).
 
-Protocol: myops380_voxel_v3 (voxel distance, empty mask policy, equal patient weight).
+Protocols:
+  - MyoPS380: myops380_voxel_v3 (voxel distance, empty mask policy, equal patient weight)
+  - MyoPS++:  myopspp_unet2d_roi128_1mm_predicted_roi_mm_v1 (physical mm distance [1.0, 1.0, s_z])
 Exports canonical predictions to <run_dir>/test_predictions/<CaseID>_pred.npz.
 Computes and saves per_case.csv and metrics.json.
 """
@@ -15,6 +17,7 @@ import os
 from pathlib import Path
 import sys
 import time
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -25,14 +28,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets.dataset_myops import (
+    CLASS_NAMES,
     MyopsDataset,
     canonicalize_label,
-    CLASS_NAMES,
+    normalize_dataset_name,
+    resolve_default_list_dir,
 )
 from sam_lora_image_encoder import LoRA_Sam
 from segment_anything import sam_model_registry
 from utils.metrics import (
-    BENCHMARK_PROTOCOL,
+    BENCHMARK_PROTOCOLS,
     dataset_rows,
     summarize_dataset_rows,
 )
@@ -44,12 +49,14 @@ def build_parser():
     parser.add_argument("--data_root", "--data-root",
                         default=os.environ.get("MYOPS380_DATA_ROOT", "/content/MyoPS380_dataset/Processed_data"),
                         help="Root folder containing bSSFP, LGE, T2w subdirectories")
-    parser.add_argument("--list_dir", "--list-dir", default=str(PROJECT_ROOT / "lists" / "myops380_no_val"),
-                        help="Directory containing test_vol.txt")
+    parser.add_argument("--dataset", "--dataset_id", "--dataset-id", default="myops380",
+                        choices=["myops380", "myopspp", "myopspp_unet2d_roi128_1mm", "myops_380"],
+                        help="Benchmark dataset to evaluate")
+    parser.add_argument("--list_dir", "--list-dir", "--split_dir", "--split-dir", default=None,
+                        help="Directory containing test_vol.txt (defaults dynamically by dataset)")
     parser.add_argument("--output_dir", "--output-dir", default=None,
                         help="Evaluation output directory; defaults to checkpoint run directory")
     parser.add_argument("--split", default="test_vol", help="Split name to evaluate (default: test_vol)")
-    parser.add_argument("--dataset_id", "--dataset-id", default="myops380", help="Dataset identifier")
     parser.add_argument("--batch_size", "--batch-size", type=int, default=8, help="Inference slices per batch")
     parser.add_argument("--device", default="auto", help="Device (auto, cuda, cpu)")
     parser.add_argument("--amp", choices=["auto", "none", "fp16", "bf16"], default="auto", help="AMP mode")
@@ -95,7 +102,6 @@ def predict_volume(model, images, img_size=128, batch_size=8, device=None, amp_d
     model.eval()
     for start in range(0, depth, batch_size):
         stop = min(start + batch_size, depth)
-        cur_batch = stop - start
 
         # Slices to shape (B, 128, 128)
         s_bssfp = torch.from_numpy(np.ascontiguousarray(bSSFP[:, :, start:stop].transpose(2, 0, 1))).to(device)
@@ -127,6 +133,8 @@ def predict_volume(model, images, img_size=128, batch_size=8, device=None, amp_d
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    norm_dataset = normalize_dataset_name(args.dataset)
+    list_dir = Path(args.list_dir) if args.list_dir else resolve_default_list_dir(norm_dataset)
 
     checkpoint_path = Path(args.checkpoint).resolve()
     if not checkpoint_path.is_file():
@@ -157,9 +165,10 @@ def main(argv=None):
     amp_dtype = resolve_amp(args.amp, device)
     amp_str = "none" if amp_dtype is None else ("bf16" if amp_dtype == torch.bfloat16 else "fp16")
 
-    logging.info(f"=== Starting SAMed Evaluation on MyoPS380 ({args.split}) ===")
+    logging.info(f"=== Starting SAMed Evaluation on {norm_dataset} ({args.split}) ===")
     logging.info(f"Checkpoint: {checkpoint_path}")
     logging.info(f"Output directory: {output_dir}")
+    logging.info(f"List directory: {list_dir}")
     logging.info(f"Device: {device} | AMP: {amp_str}")
 
     # Load checkpoint
@@ -190,23 +199,28 @@ def main(argv=None):
     elif "model" in ckpt_data:
         net.load_state_dict(ckpt_data["model"])
     else:
-        # Fallback for lora-only saved dict
         net.load_lora_parameters(str(checkpoint_path))
 
     net.float().to(device).eval()
 
     # Load dataset
+    # On MyoPS++, disk cache is already canonical -> default label_order='canonical' prevents double-swap!
+    # On MyoPS380, disk cache is legacy -> default label_order='legacy' maps 2<->3 via LUT [0, 1, 3, 2].
     dataset = MyopsDataset(
         base_dir=args.data_root,
-        list_dir=args.list_dir,
+        list_dir=list_dir,
         split=args.split,
-        label_order="legacy",
+        dataset=norm_dataset,
     )
-    logging.info(f"Evaluation dataset contains {len(dataset)} cases (expected: 76)")
+    exp_cases = 16 if norm_dataset == "myopspp" else 76
+    logging.info(f"Evaluation dataset contains {len(dataset)} cases (expected: {exp_cases})")
 
     rows = []
     total_seconds = 0.0
     total_slices = 0
+
+    benchmark_proto = BENCHMARK_PROTOCOLS.get(norm_dataset, BENCHMARK_PROTOCOLS["myops380"])
+    dist_unit = benchmark_proto["distance_unit"]
 
     checkpoint_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
     for sample in dataset:
@@ -233,8 +247,16 @@ def main(argv=None):
         total_seconds += elapsed
         total_slices += prediction.shape[2]
 
+        spacing = sample.get("spacing")
         if target is not None:
-            case_rows = dataset_rows(prediction, target, case, compute_distance=True, dataset_id=args.dataset_id)
+            case_rows = dataset_rows(
+                prediction,
+                target,
+                case,
+                compute_distance=True,
+                dataset_id=norm_dataset,
+                spacing=spacing,
+            )
             for r in case_rows:
                 r["inference_seconds"] = elapsed
             rows.extend(case_rows)
@@ -246,12 +268,13 @@ def main(argv=None):
                 pred_dir / f"{case}_pred.npz",
                 prediction=prediction,
                 class_names=np.asarray(CLASS_NAMES),
-                spacing=np.asarray(sample.get("spacing", [np.nan, np.nan, np.nan])),
+                spacing=np.asarray(spacing if spacing is not None else [np.nan, np.nan, np.nan]),
                 affine=np.asarray(sample.get("affine", np.full((4, 4), np.nan))),
-                spacing_unit=sample.get("spacing_unit", "voxel"),
-                metric_distance_unit="voxel",
+                spacing_unit=sample.get("spacing_unit", dist_unit),
+                metric_distance_unit=dist_unit,
                 exported_label_order="canonical",
                 adapter_version="canonical_v1",
+                dataset=norm_dataset,
             )
             if sample.get("has_affine", False):
                 try:
@@ -263,11 +286,12 @@ def main(argv=None):
                 except Exception:
                     pass
 
+        dist_col = f"hd95_{dist_unit}"
         logging.info(f"{case}: {prediction.shape[2]} slices, {elapsed:.3f}s")
         for r in case_rows:
             logging.info(
                 f"{case} | {r['region']:<18} | Dice={r['dice']} IoU={r['iou']} "
-                f"Precision={r['precision']} Recall={r['recall']} HD95={r['hd95_voxel']} ASD={r['asd_voxel']}"
+                f"Precision={r['precision']} Recall={r['recall']} {dist_col.upper()}={r.get(dist_col)}"
             )
 
     if not rows and any(s["label"] is not None for s in dataset):
@@ -283,18 +307,19 @@ def main(argv=None):
         logging.info(f"Saved per-case metrics to: {csv_path}")
 
     # Summarize metrics
-    summary = summarize_dataset_rows(rows, dataset_id=args.dataset_id) if rows else {}
+    summary = summarize_dataset_rows(rows, dataset_id=norm_dataset) if rows else {}
     summary.update({
         "model_name": "SAMed",
         "model_id": "samed",
-        "dataset_id": args.dataset_id,
+        "dataset_id": norm_dataset,
         "checkpoint": str(checkpoint_path),
         "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_epoch": completed_epochs,
         "planned_epochs": planned_epochs,
         "training_complete": training_complete,
         "training_protocol": training_protocol,
-        "metric_protocol": BENCHMARK_PROTOCOL["id"],
+        "metric_protocol": benchmark_proto["id"],
+        "distance_unit": dist_unit,
         "exported_label_order": "canonical",
         "total_cases": len(dataset),
         "total_slices": total_slices,
@@ -309,27 +334,31 @@ def main(argv=None):
     logging.info(f"Saved summary metrics to: {json_path}")
 
     # Display Master Benchmark Clinical Table
+    hd95_key = f"mean_hd95_{dist_unit}"
     scar_dice = (summary.get("scar", {}).get("mean_dice") or 0.0) * 100
-    scar_hd95 = summary.get("scar", {}).get("mean_hd95_voxel") or 0.0
+    scar_hd95 = summary.get("scar", {}).get(hd95_key) or 0.0
     edema_dice = (summary.get("edema_inclusive", {}).get("mean_dice") or 0.0) * 100
-    edema_hd95 = summary.get("edema_inclusive", {}).get("mean_hd95_voxel") or 0.0
+    edema_hd95 = summary.get("edema_inclusive", {}).get(hd95_key) or 0.0
+    edema_excl_dice = (summary.get("edema", {}).get("mean_dice") or 0.0) * 100
+    edema_excl_hd95 = summary.get("edema", {}).get(hd95_key) or 0.0
     myo_dice = (summary.get("myocardial_ring", {}).get("mean_dice") or 0.0) * 100
-    myo_hd95 = summary.get("myocardial_ring", {}).get("mean_hd95_voxel") or 0.0
+    myo_hd95 = summary.get("myocardial_ring", {}).get(hd95_key) or 0.0
     avg_path_dice = (summary.get("avg_pathology_inclusive_dice") or 0.0) * 100
-    avg_path_hd95 = summary.get("avg_pathology_inclusive_hd95_voxel") or 0.0
+    avg_path_hd95 = summary.get(f"avg_pathology_inclusive_{hd95_key}") or summary.get("avg_pathology_inclusive_hd95_mm") or summary.get("avg_pathology_inclusive_hd95_voxel") or 0.0
 
     table = f"""
 =============================================================================================================
-MASTER BENCHMARK EVALUATION RESULTS (Protocol: {BENCHMARK_PROTOCOL['id']})
-Model: SAMed | Checkpoint: {checkpoint_path.name} | Cases: {len(dataset)}
+MASTER BENCHMARK EVALUATION RESULTS (Protocol: {benchmark_proto['id']})
+Model: SAMed | Dataset: {norm_dataset} | Checkpoint: {checkpoint_path.name} | Cases: {len(dataset)}
 -------------------------------------------------------------------------------------------------------------
-Region                   | Dice (%)       | HD95 (voxel)
+Region                   | Dice (%)       | HD95 ({dist_unit})
 -------------------------------------------------------------------------------------------------------------
 Scar                     | {scar_dice:6.2f}         | {scar_hd95:6.2f}
 Edema (Inclusive / AAR)  | {edema_dice:6.2f}         | {edema_hd95:6.2f}
+Edema (Exclusive)        | {edema_excl_dice:6.2f}         | {edema_excl_hd95:6.2f}
 Myocardium (Whole Ring)  | {myo_dice:6.2f}         | {myo_hd95:6.2f}
 -------------------------------------------------------------------------------------------------------------
-Avg. Pathology           | {avg_path_dice:6.2f}         | {avg_path_hd95:6.2f}
+Avg. Pathology (Incl.)   | {avg_path_dice:6.2f}         | {avg_path_hd95:6.2f}
 =============================================================================================================
 """
     logging.info(table)

@@ -1,7 +1,11 @@
-"""Entry point for training SAMed on MyoPS380 without validation.
+"""Entry point for training SAMed on MyoPS benchmarks (MyoPS380 & MyoPS++) without validation.
 
-Protocol: myops380_train304_test76_last_v1 (304 train patients / 1,972 slices, 300 epochs, no validation).
-Total updates: 300 epochs * 124 batches = 37,200 updates.
+Protocols:
+  - MyoPS380: myops380_train304_test76_last_v1 (304 train patients / 1,972 slices, 300 epochs, no validation)
+      Total updates: 300 epochs * 124 batches = 37,200 updates.
+  - MyoPS++:  myopspp_bc80_train64_test16_last_v1 (64 train patients / 296 slices, 300 epochs, no validation)
+      Total updates: 300 epochs * 19 batches = 5,700 updates.
+
 Optimizer: AdamW (base_lr=0.0003333, weight_decay=0.0001, betas=(0.9, 0.999), eps=1e-8).
 Scheduler: Polynomial decay power 0.9 with zero-based offset (im_mseg_adamw_poly_v1).
 Loss: SAMed original objective: 0.5 * CrossEntropyLoss + 0.5 * DiceLoss.
@@ -19,7 +23,7 @@ from pathlib import Path
 import random
 import sys
 import time
-from typing import Any
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -32,11 +36,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from datasets.dataset_myops import (
-    MyopsDataset,
-    RandomGenerator,
     CLASS_NAMES,
     CANONICAL_LABEL_ORDER,
     LEGACY_LABEL_ORDER,
+    MyopsDataset,
+    RandomGenerator,
+    normalize_dataset_name,
+    resolve_default_list_dir,
 )
 from sam_lora_image_encoder import LoRA_Sam
 from segment_anything import sam_model_registry
@@ -52,7 +58,7 @@ from utils.efficiency import (
     sync_if_cuda,
 )
 from utils.loss import DiceLoss, calc_loss
-from utils.metrics import BENCHMARK_PROTOCOL
+from utils.metrics import BENCHMARK_PROTOCOLS, BENCHMARK_PROTOCOL
 from utils.optimization import (
     OPTIMIZATION_PROTOCOL,
     build_optimizer,
@@ -61,13 +67,43 @@ from utils.optimization import (
 )
 
 
-NO_VAL_PROTOCOL = {
-    "id": "myops380_train304_test76_last_v1",
-    "validation": False,
-    "checkpoint_selection": "last_completed_epoch",
-    "budget_unit": "epochs",
-    "train_patients": 304,
-    "test_patients": 76,
+NO_VAL_PROTOCOLS: Dict[str, Dict[str, Any]] = {
+    "myops380": {
+        "id": "myops380_train304_test76_last_v1",
+        "validation": False,
+        "checkpoint_selection": "last_completed_epoch",
+        "budget_unit": "epochs",
+        "train_patients": 304,
+        "test_patients": 76,
+        "expected_train_slices": 1972,
+        "expected_batches_per_epoch": 124,
+        "expected_updates": 37200,
+    },
+    "myopspp": {
+        "id": "myopspp_bc80_train64_test16_last_v1",
+        "validation": False,
+        "checkpoint_selection": "last_completed_epoch",
+        "budget_unit": "epochs",
+        "train_patients": 64,
+        "test_patients": 16,
+        "expected_train_slices": 296,
+        "expected_batches_per_epoch": 19,
+        "expected_updates": 5700,
+    },
+}
+
+# Backward compatibility alias
+NO_VAL_PROTOCOL = NO_VAL_PROTOCOLS["myops380"]
+
+SPLIT_HASHES: Dict[str, Dict[str, str]] = {
+    "myops380": {
+        "train": "16248ec3630bb0493fb421aab5ffb4dc9b1d0fd49c8614d69d3098a92305f919",
+        "test_vol": "3237b31411833cedcb3ecd86d36edae356bd3f880d3fcfd915066f1c850d9cbc",
+    },
+    "myopspp": {
+        "train": "81fafb159954e37088cf38db1a96c0d9d1f2380dff0a6ff1d0458dc504ce6bea",
+        "test_vol": "3152f8f62c1410aa5c78167eb53196d3f8a39f8d1b7137033ed00faa1dcf6b55",
+    },
 }
 
 
@@ -76,8 +112,11 @@ def build_parser():
     parser.add_argument("--data_root", "--data-root",
                         default=os.environ.get("MYOPS380_DATA_ROOT", "/content/MyoPS380_dataset/Processed_data"),
                         help="Root folder containing bSSFP, LGE, T2w subdirectories")
-    parser.add_argument("--list_dir", "--list-dir", default=str(PROJECT_ROOT / "lists" / "myops380_no_val"),
-                        help="Directory containing train.txt and test_vol.txt")
+    parser.add_argument("--dataset", "--dataset_id", "--dataset-id", default="myops380",
+                        choices=["myops380", "myopspp", "myopspp_unet2d_roi128_1mm", "myops_380"],
+                        help="Target dataset benchmark (myops380 or myopspp)")
+    parser.add_argument("--list_dir", "--list-dir", "--split_dir", "--split-dir", default=None,
+                        help="Directory containing train.txt and test_vol.txt (defaults dynamically by dataset)")
     parser.add_argument("--output_dir", "--output-dir", "--run_dir", "--run-dir", default=None,
                         help="Run output directory; defaults to runs/samed_seed<seed>")
     parser.add_argument("--run_root", "--run-root", default=None,
@@ -85,7 +124,6 @@ def build_parser():
     parser.add_argument("--run_name", "--run-name", default=None,
                         help="Optional run folder name under --run_root (default: samed_seed<seed>)")
     parser.add_argument("--model_id", default="samed", help="Canonical lowercase model ID")
-    parser.add_argument("--dataset_id", "--dataset-id", default="myops380", help="Dataset identifier")
     parser.add_argument("--vit_name", default="vit_b", choices=["vit_b", "vit_l", "vit_h"], help="ViT backbone variant")
     parser.add_argument("--ckpt", default="checkpoints/sam_vit_b_01ec64.pth", help="Pretrained SAM weights path")
     parser.add_argument("--lora_ckpt", default=None, help="Optional checkpoint to initialize LoRA weights")
@@ -178,9 +216,10 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
 
 RESUMABLE_ARG_KEYS = (
     "data_root",
+    "dataset",
+    "dataset_id",
     "list_dir",
     "model_id",
-    "dataset_id",
     "vit_name",
     "ckpt",
     "lora_ckpt",
@@ -265,6 +304,13 @@ def main(argv=None):
                 resume_target.parent.parent if resume_target.parent.name == "checkpoints" else resume_target.parent
             )
             args.output_dir = str(inferred_run_dir)
+
+    norm_ds = normalize_dataset_name(getattr(args, "dataset", getattr(args, "dataset_id", "myops380")))
+    args.dataset = norm_ds
+    args.dataset_id = norm_ds
+
+    if not args.list_dir:
+        args.list_dir = str(resolve_default_list_dir(norm_ds))
 
     # Resolve paths
     if args.output_dir:
@@ -353,7 +399,11 @@ def _run_training(
     if device.type != "cuda" and "pin_memory" not in explicit_dests:
         pin_memory = False
 
-    logging.info(f"=== Starting SAMed Training on MyoPS380 (Seed {args.seed}) ===")
+    norm_ds = args.dataset
+    proto_info = NO_VAL_PROTOCOLS.get(norm_ds, NO_VAL_PROTOCOLS["myops380"])
+    benchmark_proto = BENCHMARK_PROTOCOLS.get(norm_ds, BENCHMARK_PROTOCOLS["myops380"])
+
+    logging.info(f"=== Starting SAMed Training on {norm_ds} (Seed {args.seed}) ===")
     logging.info(f"Run directory: {run_dir}")
     logging.info(f"Data root: {args.data_root} | List dir: {args.list_dir}")
     if auto_resume_missing:
@@ -391,8 +441,6 @@ def _run_training(
             return
 
     # Build SAM with LoRA on CPU first
-    # In SAMed, num_multimask_outputs = args.num_classes - 1 (e.g. 4 - 1 = 3),
-    # producing exactly num_mask_tokens = 3 + 1 = 4 output channels.
     num_multimask = args.num_classes - 1 if args.num_classes > 1 else 1
     sam_checkpoint = args.ckpt if (not has_full_resume_weights and args.ckpt and os.path.exists(args.ckpt)) else None
     if sam_checkpoint:
@@ -428,43 +476,7 @@ def _run_training(
     total_params = params_info["total_params"]
     trainable_params = params_info["trainable_params"]
 
-    # Master benchmark log line
-    logging.info(
-        f"INFO | Device {device.type} | AMP {amp_str} | "
-        f"parameters {total_params:,} (trainable: {trainable_params:,}) | "
-        f"train/val slices 1972/0 | effective batch <= {args.batch_size}"
-    )
-
-    # Save initial config early (including efficiency-only runs)
-    config_dict = {
-        "model_id": args.model_id,
-        "model_name": "SAMed",
-        "vit_name": args.vit_name,
-        "rank": args.rank,
-        "img_size": args.img_size,
-        "num_classes": args.num_classes,
-        "max_epochs": args.max_epochs,
-        "batch_size": args.batch_size,
-        "accum_steps": args.accum_steps,
-        "base_lr": args.base_lr,
-        "weight_decay": args.weight_decay,
-        "seed": args.seed,
-        "amp": args.amp,
-        "num_workers": args.num_workers,
-        "pin_memory": pin_memory,
-        "measure_efficiency": bool(args.measure_efficiency),
-        "no_val": True,
-        "total_params": total_params,
-        "trainable_params": trainable_params,
-        "training_protocol": NO_VAL_PROTOCOL,
-        "optimization_protocol": OPTIMIZATION_PROTOCOL,
-        "benchmark_protocol": BENCHMARK_PROTOCOL,
-        "label_order": "legacy",
-        "exported_label_order": "canonical",
-    }
-    with open(logs_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(config_dict, f, indent=2)
-
+    # Efficiency targets
     efficiency_json_targets = _dedupe_paths(
         [Path(args.efficiency_output), run_dir / "efficiency_metrics.json"]
     )
@@ -498,6 +510,7 @@ def _run_training(
             inference_info["peak_vram_mb"],
             inference_info["peak_vram_gb"],
         )
+
         if args.efficiency_only:
             payload = build_efficiency_payload(
                 model_name="SAMed",
@@ -523,11 +536,51 @@ def _run_training(
         base_dir=args.data_root,
         list_dir=args.list_dir,
         split="train",
+        dataset=norm_ds,
         transform=RandomGenerator(output_size=[args.img_size, args.img_size]),
-        label_order="legacy",
         low_res=low_res,
     )
-    logging.info(f"Training dataset size: {len(db_train)} slices (expected: 1,972)")
+
+    exp_slices = proto_info.get("expected_train_slices", 1972)
+    logging.info(f"Training dataset size: {len(db_train)} slices (expected: {exp_slices:,})")
+
+    # Master benchmark log line
+    logging.info(
+        f"INFO | Device {device.type} | AMP {amp_str} | "
+        f"parameters {total_params:,} (trainable: {trainable_params:,}) | "
+        f"train/val slices {len(db_train)}/0 | effective batch <= {args.batch_size}"
+    )
+
+    # Save initial config early
+    config_dict = {
+        "model_id": args.model_id,
+        "model_name": "SAMed",
+        "vit_name": args.vit_name,
+        "rank": args.rank,
+        "img_size": args.img_size,
+        "num_classes": args.num_classes,
+        "max_epochs": args.max_epochs,
+        "batch_size": args.batch_size,
+        "accum_steps": args.accum_steps,
+        "base_lr": args.base_lr,
+        "weight_decay": args.weight_decay,
+        "seed": args.seed,
+        "amp": args.amp,
+        "num_workers": args.num_workers,
+        "pin_memory": pin_memory,
+        "measure_efficiency": bool(args.measure_efficiency),
+        "no_val": True,
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "dataset_id": norm_ds,
+        "training_protocol": proto_info,
+        "optimization_protocol": OPTIMIZATION_PROTOCOL,
+        "benchmark_protocol": benchmark_proto,
+        "label_order": "canonical" if norm_ds == "myopspp" else "legacy",
+        "exported_label_order": "canonical",
+    }
+    with open(logs_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, indent=2)
 
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -545,9 +598,10 @@ def _run_training(
     batches_per_epoch = len(trainloader)
     updates_per_epoch = (batches_per_epoch + args.accum_steps - 1) // args.accum_steps
     total_planned_updates = args.max_epochs * updates_per_epoch
+    exp_updates = proto_info.get("expected_updates", 37200)
     logging.info(
         f"Batches per epoch: {batches_per_epoch} | Accumulation steps: {args.accum_steps} | "
-        f"Planned epochs: {args.max_epochs} | Total updates: {total_planned_updates} (expected: 37,200)"
+        f"Planned epochs: {args.max_epochs} | Total updates: {total_planned_updates} (expected: {exp_updates:,})"
     )
 
     # Clear CUDA cache & reset peak memory stats right before allocating training state
@@ -582,7 +636,6 @@ def _run_training(
         opt_state = resume_ckpt.get("optimizer_state_dict", resume_ckpt.get("optimizer"))
         if opt_state is not None:
             optimizer.load_state_dict(opt_state)
-            # Ensure optimizer state tensors are on the correct device
             for state_item in optimizer.state.values():
                 for k, v in state_item.items():
                     if torch.is_tensor(v):
@@ -733,7 +786,8 @@ def _run_training(
         is_complete = (epoch + 1 == args.max_epochs)
         parsed_args = vars(args).copy()
         parsed_args["no_val"] = True
-        parsed_args["dataset_id"] = args.dataset_id
+        parsed_args["dataset"] = norm_ds
+        parsed_args["dataset_id"] = norm_ds
         parsed_args["pin_memory"] = pin_memory
 
         checkpoint_payload = {
@@ -767,28 +821,26 @@ def _run_training(
             "args": parsed_args,
             "model_name": "SAMed",
             "model_id": args.model_id,
-            "dataset_id": "myops380",
-            "training_protocol": NO_VAL_PROTOCOL,
+            "dataset": norm_ds,
+            "dataset_id": norm_ds,
+            "training_protocol": proto_info,
             "optimization_protocol": OPTIMIZATION_PROTOCOL,
-            "benchmark_protocol": BENCHMARK_PROTOCOL,
-            "label_order": "legacy",
-            "source_to_internal": "LUT [0, 1, 3, 2]",
+            "benchmark_protocol": benchmark_proto,
+            "label_order": "canonical" if norm_ds == "myopspp" else "legacy",
+            "source_to_internal": "identity" if norm_ds == "myopspp" else "LUT [0, 1, 3, 2]",
             "native_to_export": "identity",
-            "split_hashes": {
-                "train": "16248ec3630bb0493fb421aab5ffb4dc9b1d0fd49c8614d69d3098a92305f919",
-                "test_vol": "3237b31411833cedcb3ecd86d36edae356bd3f880d3fcfd915066f1c850d9cbc",
-            },
+            "split_hashes": SPLIT_HASHES.get(norm_ds, {}),
             "benchmark_data": {
                 "schema_version": 2,
-                "split_protocol": "myops380_train304_test76_last_v1",
-                "source_label_order": "background_normal_scar_edema",
+                "split_protocol": proto_info["id"],
+                "source_label_order": "canonical" if norm_ds == "myopspp" else "background_normal_scar_edema",
                 "canonical_class_names": list(CLASS_NAMES),
-                "official_test_ids_sha256": "3237b31411833cedcb3ecd86d36edae356bd3f880d3fcfd915066f1c850d9cbc",
-                "split_ids_sha256": {
-                    "train": "16248ec3630bb0493fb421aab5ffb4dc9b1d0fd49c8614d69d3098a92305f919",
-                    "test_vol": "3237b31411833cedcb3ecd86d36edae356bd3f880d3fcfd915066f1c850d9cbc",
+                "official_test_ids_sha256": SPLIT_HASHES.get(norm_ds, {}).get("test_vol", ""),
+                "split_ids_sha256": SPLIT_HASHES.get(norm_ds, {}),
+                "patient_counts": {
+                    "train": proto_info.get("train_patients", 304),
+                    "test_vol": proto_info.get("test_patients", 76),
                 },
-                "patient_counts": {"train": 304, "test_vol": 76},
             },
         }
         atomic_save(final_ckpt_path, checkpoint_payload)
