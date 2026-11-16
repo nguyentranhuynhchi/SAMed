@@ -67,6 +67,8 @@ BENCHMARK_PROTOCOLS: Dict[str, Dict[str, Any]] = {
         "pathology_aggregation": "arithmetic mean of scar and exclusive-edema patient means; both required",
     },
 }
+BENCHMARK_PROTOCOLS["myopspp_unet2d_roi128_1mm"] = BENCHMARK_PROTOCOLS["myopspp"]
+BENCHMARK_PROTOCOLS["myops_380"] = BENCHMARK_PROTOCOLS["myops380"]
 
 # Backward compatibility alias
 BENCHMARK_PROTOCOL = BENCHMARK_PROTOCOLS["myops380"]
@@ -253,18 +255,18 @@ def summarize_rows(rows: List[Dict[str, Any]], dataset_id: str = "myops380") -> 
             region[f"{metric}_undefined_cases"] = len(subset) - len(values)
 
         if distance_unit == "mm":
-            region["mean_hd95_mm"] = region.get("mean_hd95_mm")
-            region["std_hd95_mm"] = region.get("std_hd95_mm")
-            region["mean_asd_mm"] = region.get("mean_asd_mm")
-            region["std_asd_mm"] = region.get("std_asd_mm")
+            region["mean_hd95_mm"] = region.get(f"mean_hd95_{distance_unit}")
+            region["std_hd95_mm"] = region.get(f"std_hd95_{distance_unit}")
+            region["mean_asd_mm"] = region.get(f"mean_asd_{distance_unit}")
+            region["std_asd_mm"] = region.get(f"std_asd_{distance_unit}")
             # Fallback alias for table extraction parsers
-            region["mean_hd95_voxel"] = region.get("mean_hd95_mm")
-            region["mean_asd_voxel"] = region.get("mean_asd_mm")
+            region["mean_hd95_voxel"] = region.get(f"mean_hd95_{distance_unit}")
+            region["mean_asd_voxel"] = region.get(f"mean_asd_{distance_unit}")
         else:
-            region["mean_hd95_voxel"] = region.get("mean_hd95_voxel")
-            region["std_hd95_voxel"] = region.get("std_hd95_voxel")
-            region["mean_asd_voxel"] = region.get("mean_asd_voxel")
-            region["std_asd_voxel"] = region.get("std_asd_voxel")
+            region["mean_hd95_voxel"] = region.get(f"mean_hd95_{distance_unit}")
+            region["std_hd95_voxel"] = region.get(f"std_hd95_{distance_unit}")
+            region["mean_asd_voxel"] = region.get(f"mean_asd_{distance_unit}")
+            region["std_asd_voxel"] = region.get(f"std_asd_{distance_unit}")
 
         summary[name] = region
 
@@ -279,6 +281,11 @@ def summarize_rows(rows: List[Dict[str, Any]], dataset_id: str = "myops380") -> 
         summary[f"avg_pathology_inclusive_{metric}"] = (
             float(np.mean(values_incl)) if all(v is not None for v in values_incl) else None
         )
+
+    summary["avg_pathology_hd95"] = summary.get(f"avg_pathology_hd95_{distance_unit}")
+    summary["avg_pathology_inclusive_hd95"] = summary.get(f"avg_pathology_inclusive_hd95_{distance_unit}")
+    summary["avg_pathology_asd"] = summary.get(f"avg_pathology_asd_{distance_unit}")
+    summary["avg_pathology_inclusive_asd"] = summary.get(f"avg_pathology_inclusive_asd_{distance_unit}")
 
     if distance_unit == "mm":
         summary["avg_pathology_hd95_mm"] = summary.get(f"avg_pathology_hd95_{distance_unit}")

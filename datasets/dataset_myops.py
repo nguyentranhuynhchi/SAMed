@@ -439,14 +439,21 @@ class MyopsDataset(Dataset):
         image2 = modalities[2][0]
 
         if self.is_volume:
-            spacing = metadata.get("spacing")
-            if spacing is not None:
-                spacing = np.asarray(spacing, dtype=np.float64)
-            elif self.dataset == "myopspp":
-                # Default isotropic in-plane ROI spacing for MyoPS++
-                spacing = np.array([1.0, 1.0, 1.0], dtype=np.float64)
+            raw_spacing = metadata.get("spacing")
+            if self.dataset == "myopspp":
+                # For MyoPS++ preprocessed ROI (128x128 1mm), in-plane spacing is exactly 1.0mm,
+                # while through-plane spacing s_z is dynamically extracted from volume metadata
+                if raw_spacing is not None:
+                    sp = np.asarray(raw_spacing, dtype=np.float64)
+                    s_z = float(sp[2]) if sp.size >= 3 else float(sp.item() if sp.size == 1 else 1.0)
+                else:
+                    s_z = 1.0
+                spacing = np.array([1.0, 1.0, s_z], dtype=np.float64)
             else:
-                spacing = np.asarray([np.nan, np.nan, np.nan], dtype=np.float64)
+                if raw_spacing is not None:
+                    spacing = np.asarray(raw_spacing, dtype=np.float64)
+                else:
+                    spacing = np.asarray([np.nan, np.nan, np.nan], dtype=np.float64)
 
             affine = np.asarray(metadata.get("affine", np.full((4, 4), np.nan)), dtype=np.float64)
             raw_unit = metadata.get("spacing_unit", "mm" if self.dataset == "myopspp" else "voxel")

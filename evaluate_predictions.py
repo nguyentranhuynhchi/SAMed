@@ -64,6 +64,10 @@ def build_parser():
     parser.add_argument("--split", default="test_vol", help="Split name to evaluate (default: test_vol)")
     parser.add_argument("--compute_distance", action=argparse.BooleanOptionalAction, default=True,
                         help="Compute Hausdorff and surface distance metrics")
+    parser.add_argument("--measure_efficiency", "--measure-efficiency", action=argparse.BooleanOptionalAction,
+                        default=False, help="Measure Complexity and Inference efficiency metrics (requires --checkpoint)")
+    parser.add_argument("--efficiency_output", "--efficiency-output", default=None,
+                        help="Optional JSON file to save measured efficiency metrics")
     return parser
 
 
@@ -192,6 +196,8 @@ def main(argv=None):
     myo_hd95 = summary.get("myocardial_ring", {}).get(hd95_key) or 0.0
     avg_path_dice = (summary.get("avg_pathology_inclusive_dice") or 0.0) * 100
     avg_path_hd95 = summary.get(f"avg_pathology_inclusive_{hd95_key}") or summary.get("avg_pathology_inclusive_hd95_mm") or summary.get("avg_pathology_inclusive_hd95_voxel") or 0.0
+    avg_path_excl_dice = (summary.get("avg_pathology_dice") or 0.0) * 100
+    avg_path_excl_hd95 = summary.get(f"avg_pathology_{hd95_key}") or summary.get("avg_pathology_hd95_mm") or summary.get("avg_pathology_hd95_voxel") or 0.0
 
     table = f"""
 =============================================================================================================
@@ -206,6 +212,7 @@ Edema (Exclusive)        | {edema_excl_dice:6.2f}         | {edema_excl_hd95:6.2
 Myocardium (Whole Ring)  | {myo_dice:6.2f}         | {myo_hd95:6.2f}
 -------------------------------------------------------------------------------------------------------------
 Avg. Pathology (Incl.)   | {avg_path_dice:6.2f}         | {avg_path_hd95:6.2f}
+Avg. Pathology (Excl.)   | {avg_path_excl_dice:6.2f}         | {avg_path_excl_hd95:6.2f}
 =============================================================================================================
 """
     logging.info(table)

@@ -80,7 +80,8 @@ NO_VAL_PROTOCOLS: Dict[str, Dict[str, Any]] = {
         "expected_updates": 37200,
     },
     "myopspp": {
-        "id": "myopspp_bc80_train64_test16_last_v1",
+        "id": "myopspp_unet2d_roi128_1mm_train64_test16_last_v1",
+        "legacy_id": "myopspp_bc80_train64_test16_last_v1",
         "validation": False,
         "checkpoint_selection": "last_completed_epoch",
         "budget_unit": "epochs",
@@ -91,6 +92,9 @@ NO_VAL_PROTOCOLS: Dict[str, Dict[str, Any]] = {
         "expected_updates": 5700,
     },
 }
+
+NO_VAL_PROTOCOLS["myopspp_unet2d_roi128_1mm"] = NO_VAL_PROTOCOLS["myopspp"]
+NO_VAL_PROTOCOLS["myops_380"] = NO_VAL_PROTOCOLS["myops380"]
 
 # Backward compatibility alias
 NO_VAL_PROTOCOL = NO_VAL_PROTOCOLS["myops380"]
@@ -105,6 +109,8 @@ SPLIT_HASHES: Dict[str, Dict[str, str]] = {
         "test_vol": "3152f8f62c1410aa5c78167eb53196d3f8a39f8d1b7137033ed00faa1dcf6b55",
     },
 }
+SPLIT_HASHES["myopspp_unet2d_roi128_1mm"] = SPLIT_HASHES["myopspp"]
+SPLIT_HASHES["myops_380"] = SPLIT_HASHES["myops380"]
 
 
 def build_parser():

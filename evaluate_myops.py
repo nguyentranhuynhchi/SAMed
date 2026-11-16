@@ -66,6 +66,10 @@ def build_parser():
     parser.add_argument("--rank", type=int, default=4, help="LoRA rank")
     parser.add_argument("--img_size", type=int, default=128, help="Model image size")
     parser.add_argument("--num_classes", type=int, default=4, help="Number of canonical classes")
+    parser.add_argument("--measure_efficiency", "--measure-efficiency", action=argparse.BooleanOptionalAction,
+                        default=False, help="Measure Complexity and Inference efficiency metrics")
+    parser.add_argument("--efficiency_output", "--efficiency-output", default=None,
+                        help="Optional JSON file to save measured efficiency metrics")
     return parser
 
 
@@ -202,6 +206,44 @@ def main(argv=None):
         net.load_lora_parameters(str(checkpoint_path))
 
     net.float().to(device).eval()
+
+    if args.measure_efficiency:
+        from utils.efficiency import (
+            SAMedInferenceWrapper,
+            count_parameters,
+            measure_flops,
+            measure_inference_efficiency,
+        )
+        params_info = count_parameters(net)
+        wrapper = SAMedInferenceWrapper(net, image_size=args.img_size, multimask_output=True)
+        flops_info = measure_flops(wrapper, input_shape=(1, 3, args.img_size, args.img_size), device=device)
+        inference_info = measure_inference_efficiency(
+            wrapper,
+            input_shape=(1, 3, args.img_size, args.img_size),
+            device=device,
+            warmup=30 if device.type == "cuda" else 2,
+            repeats=100 if device.type == "cuda" else 5,
+        )
+        logging.info(
+            "Efficiency | Params: Trainable %.2fM / Total %.2fM | FLOPs: %.2f G | Latency: %.2f ms",
+            params_info["trainable_params_m"],
+            params_info["total_params_m"],
+            flops_info["flops_g"],
+            inference_info["latency_ms_per_slice"],
+        )
+        eff_payload = {
+            "model_name": "SAMed",
+            "model_id": "samed",
+            "dataset_id": norm_dataset,
+            "params_info": params_info,
+            "flops_info": flops_info,
+            "inference_info": inference_info,
+        }
+        eff_out = Path(args.efficiency_output) if args.efficiency_output else (output_dir / "efficiency_metrics.json")
+        eff_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(eff_out, "w", encoding="utf-8") as f:
+            json.dump(eff_payload, f, indent=2)
+        logging.info(f"Saved efficiency metrics to: {eff_out}")
 
     # Load dataset
     # On MyoPS++, disk cache is already canonical -> default label_order='canonical' prevents double-swap!
@@ -345,6 +387,8 @@ def main(argv=None):
     myo_hd95 = summary.get("myocardial_ring", {}).get(hd95_key) or 0.0
     avg_path_dice = (summary.get("avg_pathology_inclusive_dice") or 0.0) * 100
     avg_path_hd95 = summary.get(f"avg_pathology_inclusive_{hd95_key}") or summary.get("avg_pathology_inclusive_hd95_mm") or summary.get("avg_pathology_inclusive_hd95_voxel") or 0.0
+    avg_path_excl_dice = (summary.get("avg_pathology_dice") or 0.0) * 100
+    avg_path_excl_hd95 = summary.get(f"avg_pathology_{hd95_key}") or summary.get("avg_pathology_hd95_mm") or summary.get("avg_pathology_hd95_voxel") or 0.0
 
     table = f"""
 =============================================================================================================
@@ -359,6 +403,7 @@ Edema (Exclusive)        | {edema_excl_dice:6.2f}         | {edema_excl_hd95:6.2
 Myocardium (Whole Ring)  | {myo_dice:6.2f}         | {myo_hd95:6.2f}
 -------------------------------------------------------------------------------------------------------------
 Avg. Pathology (Incl.)   | {avg_path_dice:6.2f}         | {avg_path_hd95:6.2f}
+Avg. Pathology (Excl.)   | {avg_path_excl_dice:6.2f}         | {avg_path_excl_hd95:6.2f}
 =============================================================================================================
 """
     logging.info(table)

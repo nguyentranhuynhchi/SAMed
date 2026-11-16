@@ -251,6 +251,29 @@ class TestDistanceMetricsAndSpacing(unittest.TestCase):
         self.assertAlmostEqual(summary["scar"]["mean_dice"], 1.0)
         self.assertAlmostEqual(summary["edema_inclusive"]["mean_dice"], 1.0)
 
+    def test_myopspp_dynamic_spacing_extraction(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            data_root = tmp_path / "Processed_data"
+            for mod in ("bSSFP", "LGE", "T2w"):
+                (data_root / mod / "test_vol_h5").mkdir(parents=True)
+
+            list_dir = tmp_path / "lists"
+            list_dir.mkdir(parents=True)
+            (list_dir / "test_vol.txt").write_text("Case2001\n", encoding="utf-8")
+
+            vol_img = np.zeros((128, 128, 4), dtype=np.float32)
+            for mod in ("bSSFP", "LGE", "T2w"):
+                with h5py.File(data_root / mod / "test_vol_h5" / "Case2001.npy.h5", "w") as hf:
+                    hf.create_dataset("image", data=vol_img)
+                    # Raw acquisition spacing (e.g. 1.25, 1.25, 4.5)
+                    hf.create_dataset("spacing", data=np.array([1.25, 1.25, 4.5], dtype=np.float32))
+
+            # On MyoPS++, dataset must enforce [1.0, 1.0, s_z] where s_z = 4.5
+            ds = MyopsDataset(base_dir=data_root, list_dir=list_dir, split="test_vol", dataset="myopspp")
+            sample = ds[0]
+            np.testing.assert_allclose(sample["spacing"], [1.0, 1.0, 4.5])
+
 
 class TestDynamicUpdatesAndSchedule(unittest.TestCase):
     """Test dynamic total update calculation for both datasets."""
@@ -297,9 +320,11 @@ class TestCLIParity(unittest.TestCase):
             "--checkpoint", "runs/samed_seed1234/checkpoints/samed_seed1234.pt",
             "--dataset", "myopspp",
             "--split_dir", "lists/lists_MyoPSpp",
+            "--measure_efficiency",
         ])
         self.assertEqual(args.dataset, "myopspp")
         self.assertEqual(args.list_dir, "lists/lists_MyoPSpp")
+        self.assertTrue(args.measure_efficiency)
 
     def test_predict_parser_flags(self):
         import predict
@@ -309,9 +334,11 @@ class TestCLIParity(unittest.TestCase):
             "--checkpoint", "runs/samed_seed1234/checkpoints/samed_seed1234.pt",
             "--dataset", "myopspp",
             "--split_dir", "lists/lists_MyoPSpp",
+            "--measure_efficiency",
         ])
         self.assertEqual(args.dataset, "myopspp")
         self.assertEqual(args.list_dir, "lists/lists_MyoPSpp")
+        self.assertTrue(args.measure_efficiency)
 
     def test_evaluate_predictions_parser_flags(self):
         import evaluate_predictions
@@ -321,9 +348,11 @@ class TestCLIParity(unittest.TestCase):
             "--pred_dir", "runs/samed_seed1234/test_predictions",
             "--dataset", "myopspp",
             "--split_dir", "lists/lists_MyoPSpp",
+            "--measure_efficiency",
         ])
         self.assertEqual(args.dataset, "myopspp")
         self.assertEqual(args.list_dir, "lists/lists_MyoPSpp")
+        self.assertTrue(args.measure_efficiency)
 
 
 class TestEndToEndSmokeMultiDataset(unittest.TestCase):
@@ -412,6 +441,42 @@ class TestEndToEndSmokeMultiDataset(unittest.TestCase):
             self.assertEqual(pp_metrics["dataset_id"], "myopspp")
             self.assertEqual(pp_metrics["distance_unit"], "mm")
             self.assertIn("mean_hd95_mm", pp_metrics["edema"])
+
+            # Standalone volume prediction via predict.py
+            pred_standalone = run_pp / "standalone_inference"
+            cmd_predict = [
+                sys.executable,
+                str(REPO_ROOT / "predict.py"),
+                "--dataset", "myopspp",
+                "--checkpoint", str(ckpt_pp),
+                "--data_root", str(data_root),
+                "--list_dir", str(list_pp),
+                "--output_dir", str(pred_standalone),
+                "--batch_size", "2",
+                "--amp", "none",
+                "--device", "cpu",
+                "--measure_efficiency",
+            ]
+            res_predict = subprocess.run(cmd_predict, capture_output=True, text=True)
+            self.assertEqual(res_predict.returncode, 0, msg=res_predict.stderr)
+            self.assertTrue((pred_standalone / "test_predictions" / "Case2001_pred.npz").is_file())
+            self.assertTrue((pred_standalone / "efficiency_metrics.json").is_file())
+
+            # Standalone evaluation via evaluate_predictions.py
+            eval_standalone = run_pp / "standalone_eval"
+            cmd_eval_standalone = [
+                sys.executable,
+                str(REPO_ROOT / "evaluate_predictions.py"),
+                "--dataset", "myopspp",
+                "--pred_dir", str(pred_standalone / "test_predictions"),
+                "--data_root", str(data_root),
+                "--list_dir", str(list_pp),
+                "--output_dir", str(eval_standalone),
+            ]
+            res_eval_standalone = subprocess.run(cmd_eval_standalone, capture_output=True, text=True)
+            self.assertEqual(res_eval_standalone.returncode, 0, msg=res_eval_standalone.stderr)
+            self.assertTrue((eval_standalone / "metrics.json").is_file())
+            self.assertTrue((eval_standalone / "per_case.csv").is_file())
 
 
 if __name__ == "__main__":

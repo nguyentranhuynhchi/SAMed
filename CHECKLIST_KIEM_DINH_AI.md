@@ -125,6 +125,7 @@
   - `--data_root`
   - `--checkpoint`
   - `--output_dir`
+  - `--measure_efficiency`
   không?
   - *Kiểm tra*: Kiểm tra `build_parser()` trong từng file.
 - **Q4.1.2**: Khi không truyền `--list_dir`, script có tự động nhận diện thư mục manifest mặc định phù hợp với từng dataset không?
@@ -135,9 +136,10 @@
   - Kiểm tra manifest, số lượng lát cắt, số bệnh nhân và tính độc lập của tập test.
   - Kiểm tra hàm `canonicalize_label` với mode `legacy` (đổi nhãn) và mode `canonical`/`identity` (không đổi nhãn).
   - Kiểm tra tính toán khoảng cách voxel vs khoảng cách milimet có nhân với spacing.
+  - Kiểm tra trích xuất khoảng cách vật lý động `[1.0, 1.0, s_z]` từ metadata H5 cho MyoPS++.
   - Kiểm tra tính toán tổng updates 37,200 (MyoPS380) vs 5,700 (MyoPS++).
-  - Kiểm tra giao diện dòng lệnh CLI flags.
-  - Chạy smoke test end-to-end huấn luyện 1 epoch và đánh giá volume trên dữ liệu giả lập.
+  - Kiểm tra giao diện dòng lệnh CLI flags và cờ `--measure_efficiency` trên toàn bộ 4 script entrypoints.
+  - Chạy smoke test end-to-end huấn luyện 1 epoch (`train_myops.py`), đánh giá trực tiếp (`evaluate_myops.py`), trích xuất dự đoán volume (`predict.py`) và đánh giá độc lập (`evaluate_predictions.py`) trên dữ liệu giả lập.
   - *Kiểm tra*: Chạy lệnh `python -m unittest tests/test_multi_dataset.py`.
 - **Q4.2.2**: Repo có đảm bảo 100% các bài test trong cả `tests/test_efficiency.py` và `tests/test_multi_dataset.py` vượt qua (Exit code 0, 0 failures, 0 errors) không?
   - *Kiểm tra*: Chạy lệnh `python -m unittest discover tests`.
